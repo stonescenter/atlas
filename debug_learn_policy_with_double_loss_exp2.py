@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 import random
@@ -880,8 +881,11 @@ def train_walk_policy(
         )
 
     if track_gradients and gradient_plot_path is not None:
-        plot_gradient_directions(gradient_history, gradient_plot_path)
-        print(f"Gradient direction plot saved to {gradient_plot_path}")
+        try:
+            plot_gradient_directions(gradient_history, gradient_plot_path)
+            #print(f"Gradient direction plot saved to {gradient_plot_path}")
+        except Exception as exc:
+            print(f"Warning: could not save gradient plot to {gradient_plot_path}: {exc}")
 
     return gradient_history
 
@@ -967,7 +971,7 @@ random.seed(2020)
 
 batch_size = 64
 num_neighbors = 30
-graph_df = graph_df.head(5000)
+#graph_df = graph_df.head(5000)
 val_time, test_time = list(np.quantile(graph_df.ts, [0.70, 0.85]))
 
 train_mask =  timestamps <= test_time
@@ -1017,33 +1021,35 @@ lambda_walks =  [0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0 ]
 lambda_links =  [1.0, 0.9, 0.7, 0.5, 0.3, 0.1, 0.0]
 
 modes = ["earliest", "sampled", "soft"]
-modes = ["soft"]
 
 optimizer = None
 
-#link_criterion = nn.BCEWithLogitsLoss()
+experiment = "results/exp2"
+os.makedirs(experiment, exist_ok=True)
 
 for mode in modes:
     train_dataset = TemporalWalkSupervisionDataset(train_data, graph, sampler, num_nodes=NUM_NODES, supervision_mode=mode)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_temporal_walk_link)
 
-    model = TemporalWalkModel(
-        num_nodes=NUM_NODES,
-        embedding_dim=32, 
-        time_dim=16, 
-        pad_node=PAD_NODE, 
-        debug=False).to(device)
-    
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)
-    link_criterion = nn.BCEWithLogitsLoss()
-    
     for lambda_walk, lambda_link in zip(lambda_walks, lambda_links):
         set_seed(2020)
+
+        model = TemporalWalkModel(
+            num_nodes=NUM_NODES,
+            embedding_dim=32, 
+            time_dim=16, 
+            pad_node=PAD_NODE, 
+            debug=False).to(device)
+        
+        optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)
+        link_criterion = nn.BCEWithLogitsLoss()
+
         print(f"Model params:")
         print(f"\tlambda_walk: {lambda_walk}, lambda_link: {lambda_link}")
         print(f"\tsupervision_mode: {mode}")
         print("Training...")
 
+        path_plot = f"{experiment}/gradient_cosine_walk_{mode}_{lambda_walk}_link_{lambda_link}.png"
         train_walk_policy(
             model,
             train_loader,
@@ -1055,7 +1061,7 @@ for mode in modes:
             lambda_link=lambda_link,
             supervision_mode=mode,
             track_gradients=True,
-            gradient_plot_path=f"gradient_cosine_walk_exp2_{mode}_{lambda_walk}_link_{lambda_link}.png",
+            gradient_plot_path=path_plot,
             gradient_every=10,
             temperature=1.2,
             label_smoothing=0.05,
