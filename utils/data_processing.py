@@ -1,0 +1,886 @@
+import numpy as np
+import random
+import pandas as pd
+import torch
+from collections import defaultdict
+from torch.utils.data import Dataset
+import torch.nn.functional as F
+
+'''
+https://pytorch-geometric.readthedocs.io/en/2.5.2/generated/torch_geometric.data.Data.html#torch_geometric.data.Data
+Data Parameters:
+  x (torch.Tensor, optional) : Node feature matrix with shape [num_nodes, num_node_features]. (default: None)
+  edge_index (LongTensor, optional) : Graph connectivity in COO format with shape [2, num_edges]. (default: None)
+  edge_attr (torch.Tensor, optional) : Edge feature matrix with shape [num_edges, num_edge_features]. (default: None)
+  y (torch.Tensor, optional) : Graph-level or node-level ground-truth labels with arbitrary shape. (default: None)
+  pos (torch.Tensor, optional) : Node position matrix with shape [num_nodes, num_dimensions]. (default: None)
+  time (torch.Tensor, optional) : The timestamps for each event with shape [num_edges] or [num_nodes]. (default: None)
+'''
+
+
+def temporal_target_distribution(times, mask, current_time, beta=0.1):
+    delta = times - current_time
+    delta[~mask] = 0
+
+    weights = np.exp(-beta * delta)
+    weights[~mask] = 0
+
+    probs = weights / (weights.sum() + 1e-12)
+
+    return probs.astype(np.float32)
+
+'''
+the strongest version is to sample one observed continuation according to a temporal distribution.
+prefer temporally plausible continuations 
+    q(x∣v,t)~exp(−lambda(t_x​−t))
+So closer future interactions are more likely, but not the only valid target
+'''
+def sample_temporal_target(valid_neighbors, valid_times, current_time, lamb=0.1):
+    delta = valid_times - current_time
+    weights = np.exp(-lamb * delta)
+    probs = weights / weights.sum()
+
+    idx = np.random.choice(len(valid_neighbors), p=probs)
+
+    return valid_neighbors[idx]
+
+
+def temporal_target_distribution(times, mask, current_time, beta=0.1):
+    delta = times - current_time
+    delta = np.maximum(delta, 0)
+
+    weights = np.exp(-beta * delta).astype(np.float32)
+    weights[~mask] = 0.0
+
+    total = weights.sum()
+    if total <= 0:
+        return None
+    probs = weights / total
+    return probs
+
+class ContextBase(Dataset):
+    def __init__(self, graph, sampler):
+        self.examples = []
+        self.graph = graph
+        self.sampler = sampler
+
+    def build_context(self, node, ts):
+        neighbors, times, mask, n_valid = self.sampler.sample_k(
+            node_id=node,
+            current_time=ts,
+            is_forward=True
+        )
+
+        if n_valid == 0:
+            return None
+
+        deg_current = self.graph.get_degree(node)
+        deg_neighbors = self.graph.get_degree_neighbors(neighbors)
+
+        delta_t = times - ts
+        delta_t[~mask] = 0
+        delta_t = np.maximum(delta_t, 0)
+
+        return {
+            "deg_current": deg_current,
+            "neighbors": neighbors,
+            "deg_neighbors": deg_neighbors,
+            "delta_t": delta_t,
+            "mask": mask,
+            "times": times,
+        }
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        return self.examples[idx]
+    
+class TemporalWalkSupervisionDataset(ContextBase):
+    """
+    supervision_mode:
+        "earliest" -> Experiment 1
+        "sampled"  -> Experiment 2
+        "soft"     -> Experiment 3
+    """
+
+    def __init__(
+        self,
+        edge_dataset,
+        graph,
+        sampler,
+        num_nodes,
+        supervision_mode="earliest",
+        beta=0.1
+    ):
+        super().__init__(graph, sampler)
+        self.supervision_mode = supervision_mode
+        self.beta = beta
+        self.num_nodes = num_nodes
+
+        assert supervision_mode in {
+            "earliest",
+            "sampled",
+            "soft",
+        }
+
+        for sample in edge_dataset:
+            src = int(sample["src"])
+            dst = int(sample["dst"])
+            ts = float(sample["ts"])
+
+            pos_context = self.build_context(node=dst, ts=ts)
+            if pos_context is None:
+                continue
+
+            neg_dst = self.sample_negative_node(src=src, dst=dst, ts=ts)
+            neg_context = self.build_context(node=neg_dst, ts=ts)
+            if neg_context is None:
+                continue
+
+            example = {
+                "src": src,
+                "dst": dst,
+                "neg_dst": neg_dst,
+                "pos_neighbors": pos_context["neighbors"],
+                "pos_deg_current": pos_context["deg_current"],
+                "pos_deg_neighbors": pos_context["deg_neighbors"],
+                "pos_delta_t": pos_context["delta_t"],
+                "pos_mask": pos_context["mask"],
+                "neg_neighbors": neg_context["neighbors"],
+                "neg_deg_current": neg_context["deg_current"],
+                "neg_deg_neighbors": neg_context["deg_neighbors"],
+                "neg_delta_t": neg_context["delta_t"],
+                "neg_mask": neg_context["mask"],
+            }
+
+            # ---------------------------------------
+            # Experiment 1: earliest future neighbor
+            # ---------------------------------------
+            if supervision_mode == "earliest":
+                example["target_idx"] = 0
+
+            # ---------------------------------------
+            # Experiment 2: sampled temporal target
+            # q(x) proportional to exp(-beta * delta_t)
+            # ---------------------------------------
+            elif supervision_mode == "sampled":
+                probs = temporal_target_distribution(
+                    times=pos_context["times"], 
+                    mask=pos_context["mask"], 
+                    current_time=ts, 
+                    beta=beta
+                )
+
+                if probs is None:
+                    continue
+
+                target_idx = np.random.choice(
+                    len(probs),
+                    p=probs,
+                )
+                example["target_probs"] = probs
+                example["target_idx"] = int(target_idx)
+
+            # ---------------------------------------
+            # Experiment 3: soft-label supervision
+            # target_probs = q(x)
+            # ---------------------------------------
+            elif supervision_mode == "soft":
+                probs = temporal_target_distribution(
+                    times=pos_context["times"], 
+                    mask=pos_context["mask"], 
+                    current_time=ts, 
+                    beta=beta
+                )
+
+                if probs is None:
+                    continue
+
+                example["target_probs"] = probs.astype(np.float32)
+
+            self.examples.append(example)
+
+    def sample_negative_node(self, src, dst, ts=None, pool_size=16):
+        if self.num_nodes <= 0:
+            return int(dst)
+        seen = {src, dst}
+        if ts is None:
+            candidate_nodes = set(self.graph.get_neighbors(dst, undirected=True, unique=True))
+        else:
+            candidate_nodes = set(self.graph.get_neighbors(dst, timestamp=ts, undirected=True, unique=True))
+        candidate_nodes = [node for node in candidate_nodes if node not in seen]
+        if len(candidate_nodes) > pool_size:
+            candidate_nodes = list(np.random.choice(candidate_nodes, size=pool_size, replace=False))
+        if not candidate_nodes:
+            return int(dst)
+
+        dst_degree = self.graph.get_degree(dst)
+        weights = np.ones(len(candidate_nodes), dtype=np.float32)
+        for idx, node in enumerate(candidate_nodes):
+            degree_gap = abs(self.graph.get_degree(node) - dst_degree)
+            weights[idx] = 1.0 + 1.0 / (1.0 + degree_gap)
+        weights = np.maximum(weights, 1e-6)
+        probs = weights / weights.sum()
+        return int(np.random.choice(candidate_nodes, p=probs))
+
+    
+    def __getitem__(self, idx):
+        '''
+        In every epoch get different sample  
+        '''    
+        example = self.examples[idx]
+
+        if self.supervision_mode == "sampled":
+
+            probs = example["target_probs"]
+
+            target = np.random.choice(
+                len(probs),
+                p=probs,
+            )
+
+            example["target_idx"] = target
+
+        return example
+    
+class TemporalWalkContinuationDataset(torch.utils.data.Dataset):
+
+    def __init__(self, edge_dataset, graph, sampler):
+        self.examples = []
+
+        for sample in edge_dataset:
+            u = int(sample["src"])
+            v = int(sample["dst"])
+            t = float(sample["ts"])
+
+            neighbors, times, mask, n_valid = sampler.sample(
+                node_id=v,
+                current_time=t,
+                is_forward=True,
+            )
+
+            if n_valid == 0:
+                continue
+
+            # valid candidates only
+            valid_neighbors = neighbors[mask]
+            valid_times = times[mask]
+
+            # observed continuation: earliest edge from v after t
+            # BUT target_idx is now derived from the actual candidate node
+            next_idx_valid = np.argmin(valid_times)
+            x_true = valid_neighbors[next_idx_valid]
+
+            # find x_true inside full padded candidate array
+            target_positions = np.where(neighbors == x_true)[0]
+
+            if len(target_positions) == 0:
+                continue
+
+            #This is still close to current version, but it makes the target explicit.
+            target_idx = int(target_positions[0])
+
+            x_true = sample_temporal_target(
+                valid_neighbors,
+                valid_times,
+                t,
+                beta=0.1,
+            )
+
+            deg_current = graph.get_degree(v)
+            deg_neighbors = graph.get_degree_neighbors(neighbors)
+
+            delta_t = times - t
+            delta_t[~mask] = 0
+
+            self.examples.append({
+                "src": u,
+                "dst": v,
+                "neighbors": neighbors,
+                "deg_current": deg_current,
+                "deg_neighbors": deg_neighbors,
+                "delta_t": delta_t,
+                "mask": mask,
+                "target_idx": target_idx,
+                "target_node": int(x_true),
+            })
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        return self.examples[idx]
+
+#class TemporalWalkLinkDataset(torch.utils.data.Dataset):
+class TemporalWalkLinkDataset(ContextBase):
+    
+    def __init__(self, edge_dataset, graph, sampler, num_nodes):
+        super().__init__(graph, sampler)
+        self.num_nodes = num_nodes
+
+        for sample in edge_dataset:
+            src = int(sample["src"])
+            dst = int(sample["dst"])
+            ts = float(sample["ts"])
+
+            pos = self.build_context(dst, ts)
+            if pos is None:
+                continue
+
+            neg_dst = np.random.randint(0, num_nodes)
+            tries = 0
+
+            while (neg_dst == dst or neg_dst == src) and tries < 20:
+                neg_dst = np.random.randint(0, num_nodes)
+                tries += 1
+
+            neg = self.build_context(neg_dst, ts)
+            if neg is None:
+                continue
+
+            self.examples.append({
+                "src": src,
+                "dst": dst,
+                "neg_dst": neg_dst,
+
+                "pos_deg_current": pos["deg_current"],
+                "pos_neighbors": pos["neighbors"],
+                "pos_deg_neighbors": pos["deg_neighbors"],
+                "pos_delta_t": pos["delta_t"],
+                "pos_mask": pos["mask"],
+
+                "neg_deg_current": neg["deg_current"],
+                "neg_neighbors": neg["neighbors"],
+                "neg_deg_neighbors": neg["deg_neighbors"],
+                "neg_delta_t": neg["delta_t"],
+                "neg_mask": neg["mask"],
+
+                "target_idx": 0,   # earliest future neighbor
+            })
+
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        return self.examples[idx]
+    
+'''
+ Precomputed dst, neighbors, graph.get_degree()
+'''
+class TemporalWalkDataset(Dataset):
+
+    def __init__( 
+        self,
+        edge_dataset,
+        graph,
+        sampler,
+        num_nodes
+    ):
+
+        self.examples = []
+        self.num_nodes = num_nodes
+
+        for sample in edge_dataset:
+            src = sample["src"]
+            dst = sample["dst"]
+            ts  = sample["ts"]
+
+            neighbors, times, mask, n_valid = sampler.sample_k(
+                node_id=dst,
+                current_time=ts,
+                is_forward=True
+            )
+
+            if n_valid == 0:
+                continue
+
+            deg_current = graph.get_degree(dst)
+            deg_neighbors = graph.get_degree_neighbors(neighbors)
+
+            delta_t = times - ts
+            
+            neg_dst = np.random.randint(0,  num_nodes)
+
+            while neg_dst == dst:
+                neg_dst = np.random.randint(0, num_nodes)
+
+            self.examples.append(
+                {
+                    "src": src,
+                    "dst": dst,
+                    "deg_current": deg_current,
+                    "neighbors": neighbors,
+                    "deg_neighbors": deg_neighbors,
+                    "delta_t": delta_t,
+                    "mask": mask,
+                    "target_idx": 0,
+                    "neg_dst": neg_dst
+                }
+            )
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        return self.examples[idx]
+    
+class EdgeDataset(Dataset):
+
+    def __init__(
+        self,
+        sources,
+        destinations,
+        timestamps,
+        edge_idxs,
+        labels,
+    ):
+
+        self.sources = sources
+        self.destinations = destinations
+        self.timestamps = timestamps
+        self.edge_idxs = edge_idxs
+        self.labels = labels
+        
+        n = len(self.sources)
+        self.n_interactions = n
+
+        self.unique_nodes = (
+            set(sources) | set(destinations)
+        )
+
+        self.n_unique_nodes = len(self.unique_nodes)
+
+    def __len__(self):
+
+        return len(self.sources)
+
+    def __getitem__(self, idx):
+
+        return {
+            "src": self.sources[idx],
+            "dst": self.destinations[idx],
+            "ts": self.timestamps[idx],
+            "label": self.labels[idx],
+        }
+
+
+class Graph(Dataset):
+
+    def __init__(
+        self,
+        sources,
+        destinations,
+        timestamps,
+        edge_idxs,
+        labels,
+    ):
+
+        n = len(sources)
+
+        if not (
+            len(destinations) == n and
+            len(timestamps) == n and
+            len(edge_idxs) == n and
+            len(labels) == n
+        ):
+            raise ValueError(
+                "All inputs must have same length."
+            )
+
+        self.sources = np.array(sources)
+        self.destinations = np.array(destinations)
+        self.timestamps = np.array(timestamps)
+        self.edge_idxs = np.array(edge_idxs)
+        self.labels = np.array(labels)
+        self.index = 0
+
+        self.n_interactions = n
+
+        self.unique_nodes = (
+            set(sources) | set(destinations)
+        )
+
+        self.n_unique_nodes = len(self.unique_nodes)
+
+        self.adj_list = defaultdict(list)
+
+        for src, dst, ts, eidx, lbl in zip(
+            self.sources,
+            self.destinations,
+            self.timestamps,
+            self.edge_idxs,
+            self.labels,
+        ):
+
+            self.adj_list[src].append((dst, ts, eidx, lbl))
+            self.adj_list[dst].append((src, ts, eidx, lbl))
+
+        '''
+        for node in self.adj_list:
+            self.adj_list[node].sort(
+                key=lambda x: x[1]
+            )
+        '''
+
+        self.mapping_degrees = self._node_degrees()
+        
+        eps = 1e-10
+        self.inv_sqrt_degree = {
+            n: 1 / np.sqrt(deg + eps) for n, deg in self.mapping_degrees.items()
+        }
+
+    def __len__(self):
+        return self.n_interactions
+
+    def __getitem__(self, idx):
+
+        return {
+            "src": self.sources[idx],
+            "dst": self.destinations[idx],
+            "ts": self.timestamps[idx],
+            "idx": self.edge_idxs[idx],
+            "label": self.labels[idx],
+        }
+            
+    def __iter__(self):
+        return self
+    
+    def __next__(self):
+        if self.index < self.n_interactions:
+            result = (
+                  self.sources[self.index],
+                  self.destinations[self.index],
+                  self.timestamps[self.index])
+            
+            self.index+=1
+            return result
+        else:
+            raise StopIteration
+
+    def get_nodes(self):
+        return self.unique_nodes
+    
+    def get_neighbors(
+        self,
+        node_id,
+        timestamp=None,
+        is_fordward=True,
+        undirected=True,
+        unique=True,
+    ):
+
+
+        # Temporal filtering
+        if timestamp is not None:
+            if is_fordward:
+                temporal_mask = self.timestamps > timestamp
+            else:
+                temporal_mask = self.timestamps < timestamp
+ 
+        else:
+            temporal_mask = np.ones(
+                self.n_interactions,
+                dtype=bool
+            )
+
+        src = self.sources[temporal_mask]
+        dst = self.destinations[temporal_mask]
+
+        # Outgoing neighbors
+        out_neighbors = dst[src == node_id]
+
+        if undirected:
+
+            # Incoming neighbors
+            in_neighbors = src[dst == node_id]
+
+            neighbors = np.concatenate(
+                [out_neighbors, in_neighbors]
+            )
+
+        else:
+            neighbors = out_neighbors
+
+        if unique:
+            neighbors = np.unique(neighbors)
+
+        return neighbors
+    
+    def get_neighbors_array(self, node_id, include_edge_weight=False):
+
+        neighbors = []
+        times = []
+        
+        for (neighbor, time, _, _) in self.adj_list[node_id]:
+            neighbors.append(neighbor)
+            times.append(time)
+
+        outputs = [
+            np.asarray(neighbors),
+            np.asarray(times)]
+        
+        return outputs if include_edge_weight else np.asarray(neighbors)
+        
+    def _get_degree(
+        self,
+        node_id,
+        timestamp=None,
+        undirected=True,
+        unique=True,
+    ):
+
+        neighbors = self.get_neighbors(
+            node_id=node_id,
+            timestamp=timestamp,
+            undirected=undirected,
+            unique=unique,
+        )
+
+        return len(neighbors)
+    
+    def get_degree(self, node_id):
+       return self.mapping_degrees[node_id]
+    
+    def _node_degrees(self):
+        mapping = {node: self._get_degree(node) for node in self.get_nodes()}
+        return mapping
+    
+    def get_degree_neighbors(self, neighbors, time=None):
+        '''
+            retorna o grau de uma lista de nos
+        '''
+        result = []
+        if time is None:
+            result = [self.get_degree(node_id=n) for n in neighbors]
+        else:
+            result = [self._get_degree(node_id=n, timestamp=time) for n in neighbors]
+
+        return result
+    
+class Data:
+  def __init__(self, sources, destinations, timestamps, edge_idxs, labels):
+    self.sources = sources
+    self.destinations = destinations
+    self.timestamps = timestamps
+    self.edge_idxs = edge_idxs
+    self.labels = labels
+    self.n_interactions = len(sources)
+    self.unique_nodes = set(sources) | set(destinations)
+    self.n_unique_nodes = len(self.unique_nodes)
+    
+
+def get_data_node_classification(path_file, dataset_name, use_validation=False):
+  ### Load data and train val test split
+  graph_df = pd.read_csv('{}/ml_{}.csv'.format(path_file, dataset_name))
+  edge_features = np.load('{}/ml_{}.npy'.format(path_file, dataset_name))
+  node_features = np.load('{}/ml_{}_node.npy'.format(path_file, dataset_name)) 
+
+  val_time, test_time = list(np.quantile(graph_df.ts, [0.70, 0.85]))
+
+  sources = graph_df.u.values
+  destinations = graph_df.i.values
+  edge_idxs = graph_df.idx.values
+  labels = graph_df.label.values
+  timestamps = graph_df.ts.values
+
+  random.seed(2020)
+
+  train_mask = timestamps <= val_time if use_validation else timestamps <= test_time
+  test_mask = timestamps > test_time
+  val_mask = np.logical_and(timestamps <= test_time, timestamps > val_time) if use_validation else test_mask
+
+  full_data = Data(sources, destinations, timestamps, edge_idxs, labels)
+
+  train_data = Data(sources[train_mask], destinations[train_mask], timestamps[train_mask],
+                    edge_idxs[train_mask], labels[train_mask])
+
+  val_data = Data(sources[val_mask], destinations[val_mask], timestamps[val_mask],
+                  edge_idxs[val_mask], labels[val_mask])
+
+  test_data = Data(sources[test_mask], destinations[test_mask], timestamps[test_mask],
+                   edge_idxs[test_mask], labels[test_mask])
+
+  return full_data, node_features, edge_features, train_data, val_data, test_data
+
+
+def get_data(path_file, dataset_name, different_new_nodes_between_val_and_test=False, randomize_features=False):
+  ### Load data and train val test split
+  graph_df = pd.read_csv('{}/ml_{}.csv'.format(path_file, dataset_name))
+  edge_features = np.load('{}/ml_{}.npy'.format(path_file, dataset_name))
+  node_features = np.load('{}/ml_{}_node.npy'.format(path_file, dataset_name)) 
+  
+  if randomize_features:
+    node_features = np.random.rand(node_features.shape[0], node_features.shape[1])
+
+  val_time, test_time = list(np.quantile(graph_df.ts, [0.70, 0.85]))
+
+  sources = graph_df.u.values
+  destinations = graph_df.i.values
+  edge_idxs = graph_df.idx.values
+  labels = graph_df.label.values
+  timestamps = graph_df.ts.values
+
+  full_data = EdgeDataset(sources, destinations, timestamps, edge_idxs, labels)
+
+  random.seed(2020)
+
+  node_set = set(sources) | set(destinations)
+  n_total_unique_nodes = len(node_set)
+
+  # Compute nodes which appear at test time
+  test_node_set = set(sources[timestamps > val_time]).union(
+    set(destinations[timestamps > val_time]))
+  # Sample nodes which we keep as new nodes (to test inductiveness), so than we have to remove all
+  # their edges from training
+  new_test_node_set = set(random.sample(test_node_set, int(0.1 * n_total_unique_nodes)))
+
+  # Mask saying for each source and destination whether they are new test nodes
+  new_test_source_mask = graph_df.u.map(lambda x: x in new_test_node_set).values
+  new_test_destination_mask = graph_df.i.map(lambda x: x in new_test_node_set).values
+
+  # Mask which is true for edges with both destination and source not being new test nodes (because
+  # we want to remove all edges involving any new test node)
+  observed_edges_mask = np.logical_and(~new_test_source_mask, ~new_test_destination_mask)
+
+  # For train we keep edges happening before the validation time which do not involve any new node
+  # used for inductiveness
+  train_mask = np.logical_and(timestamps <= val_time, observed_edges_mask)
+
+  train_data = EdgeDataset(sources[train_mask], destinations[train_mask], timestamps[train_mask],
+                    edge_idxs[train_mask], labels[train_mask])
+
+  # define the new nodes sets for testing inductiveness of the model
+  train_node_set = set(train_data.sources).union(train_data.destinations)
+  assert len(train_node_set & new_test_node_set) == 0
+  new_node_set = node_set - train_node_set
+
+  val_mask = np.logical_and(timestamps <= test_time, timestamps > val_time)
+  test_mask = timestamps > test_time
+
+  if different_new_nodes_between_val_and_test:
+    n_new_nodes = len(new_test_node_set) // 2
+    val_new_node_set = set(list(new_test_node_set)[:n_new_nodes])
+    test_new_node_set = set(list(new_test_node_set)[n_new_nodes:])
+
+    edge_contains_new_val_node_mask = np.array(
+      [(a in val_new_node_set or b in val_new_node_set) for a, b in zip(sources, destinations)])
+    edge_contains_new_test_node_mask = np.array(
+      [(a in test_new_node_set or b in test_new_node_set) for a, b in zip(sources, destinations)])
+    new_node_val_mask = np.logical_and(val_mask, edge_contains_new_val_node_mask)
+    new_node_test_mask = np.logical_and(test_mask, edge_contains_new_test_node_mask)
+
+
+  else:
+    edge_contains_new_node_mask = np.array(
+      [(a in new_node_set or b in new_node_set) for a, b in zip(sources, destinations)])
+    new_node_val_mask = np.logical_and(val_mask, edge_contains_new_node_mask)
+    new_node_test_mask = np.logical_and(test_mask, edge_contains_new_node_mask)
+
+  # validation and test with all edges
+  val_data = EdgeDataset(sources[val_mask], destinations[val_mask], timestamps[val_mask],
+                  edge_idxs[val_mask], labels[val_mask])
+
+  test_data = EdgeDataset(sources[test_mask], destinations[test_mask], timestamps[test_mask],
+                   edge_idxs[test_mask], labels[test_mask])
+
+  # validation and test with edges that at least has one new node (not in training set)
+  new_node_val_data = EdgeDataset(sources[new_node_val_mask], destinations[new_node_val_mask],
+                           timestamps[new_node_val_mask],
+                           edge_idxs[new_node_val_mask], labels[new_node_val_mask])
+
+  new_node_test_data = EdgeDataset(sources[new_node_test_mask], destinations[new_node_test_mask],
+                            timestamps[new_node_test_mask], edge_idxs[new_node_test_mask],
+                            labels[new_node_test_mask])
+
+  print("The dataset has {} interactions, involving {} different nodes".format(full_data.n_interactions,
+                                                                      full_data.n_unique_nodes))
+  print("The training dataset has {} interactions, involving {} different nodes".format(
+    train_data.n_interactions, train_data.n_unique_nodes))
+  print("The validation dataset has {} interactions, involving {} different nodes".format(
+    val_data.n_interactions, val_data.n_unique_nodes))
+  print("The test dataset has {} interactions, involving {} different nodes".format(
+    test_data.n_interactions, test_data.n_unique_nodes))
+  print("The new node validation dataset has {} interactions, involving {} different nodes".format(
+    new_node_val_data.n_interactions, new_node_val_data.n_unique_nodes))
+  print("The new node test dataset has {} interactions, involving {} different nodes".format(
+    new_node_test_data.n_interactions, new_node_test_data.n_unique_nodes))
+  print("{} nodes were used for the inductive testing, i.e. are never seen during training".format(
+    len(new_test_node_set)))
+
+  return node_features, edge_features, full_data, train_data, val_data, test_data, \
+         new_node_val_data, new_node_test_data
+
+
+def compute_time_statistics(sources, destinations, timestamps):
+  last_timestamp_sources = dict()
+  last_timestamp_dst = dict()
+  all_timediffs_src = []
+  all_timediffs_dst = []
+  for k in range(len(sources)):
+    source_id = sources[k]
+    dest_id = destinations[k]
+    c_timestamp = timestamps[k]
+    if source_id not in last_timestamp_sources.keys():
+      last_timestamp_sources[source_id] = 0
+    if dest_id not in last_timestamp_dst.keys():
+      last_timestamp_dst[dest_id] = 0
+    all_timediffs_src.append(c_timestamp - last_timestamp_sources[source_id])
+    all_timediffs_dst.append(c_timestamp - last_timestamp_dst[dest_id])
+    last_timestamp_sources[source_id] = c_timestamp
+    last_timestamp_dst[dest_id] = c_timestamp
+  assert len(all_timediffs_src) == len(sources)
+  assert len(all_timediffs_dst) == len(sources)
+  mean_time_shift_src = np.mean(all_timediffs_src)
+  std_time_shift_src = np.std(all_timediffs_src)
+  mean_time_shift_dst = np.mean(all_timediffs_dst)
+  std_time_shift_dst = np.std(all_timediffs_dst)
+
+  return mean_time_shift_src, std_time_shift_src, mean_time_shift_dst, std_time_shift_dst
+
+
+
+def collate_temporal_walk(batch):
+    output = {
+        "src": torch.tensor([x["src"] for x in batch], dtype=torch.long),
+        "dst": torch.tensor([x["dst"] for x in batch], dtype=torch.long),
+        "deg_current": torch.tensor([x["deg_current"] for x in batch], dtype=torch.long),
+        "neighbors": torch.tensor(np.stack([x["neighbors"] for x in batch]), dtype=torch.long),
+        "deg_neighbors": torch.tensor(np.stack([x["deg_neighbors"] for x in batch]), dtype=torch.long),
+        "delta_t": torch.tensor(np.stack([x["delta_t"] for x in batch]), dtype=torch.float),
+        "mask": torch.tensor(np.stack([x["mask"] for x in batch]), dtype=torch.bool),
+        "neg_dst": torch.tensor([x["neg_dst"] for x in batch], dtype=torch.long),
+    }
+
+    if "target_idx" in batch[0]:
+        output["target_idx"] = torch.tensor([x["target_idx"] for x in batch], dtype=torch.long)
+    elif "target_probs" in batch[0]:
+        output["target_probs"] = torch.tensor(np.stack([x["target_probs"] for x in batch]), dtype=torch.float)
+
+    return output
+
+
+def collate_temporal_walk_link(batch):
+    output = {
+        "src": torch.tensor([x["src"] for x in batch], dtype=torch.long),
+        "dst": torch.tensor([x["dst"] for x in batch], dtype=torch.long),
+        "neg_dst": torch.tensor([x["neg_dst"] for x in batch], dtype=torch.long),
+
+        "pos_deg_current": torch.tensor([x["pos_deg_current"] for x in batch], dtype=torch.long),
+        "pos_neighbors": torch.tensor(np.stack([x["pos_neighbors"] for x in batch]), dtype=torch.long),
+        "pos_deg_neighbors": torch.tensor(np.stack([x["pos_deg_neighbors"] for x in batch]), dtype=torch.long),
+        "pos_delta_t": torch.tensor(np.stack([x["pos_delta_t"] for x in batch]), dtype=torch.float),
+        "pos_mask": torch.tensor(np.stack([x["pos_mask"] for x in batch]), dtype=torch.bool),
+
+        "neg_deg_current": torch.tensor([x["neg_deg_current"] for x in batch], dtype=torch.long),
+        "neg_neighbors": torch.tensor(np.stack([x["neg_neighbors"] for x in batch]), dtype=torch.long),
+        "neg_deg_neighbors": torch.tensor(np.stack([x["neg_deg_neighbors"] for x in batch]), dtype=torch.long),
+        "neg_delta_t": torch.tensor(np.stack([x["neg_delta_t"] for x in batch]), dtype=torch.float),
+        "neg_mask": torch.tensor(np.stack([x["neg_mask"] for x in batch]), dtype=torch.bool),
+    }
+    if "target_idx" in batch[0]:
+        output["target_idx"] = torch.tensor([x["target_idx"] for x in batch], dtype=torch.long)
+    elif "target_probs" in batch[0]:
+        output["target_probs"] = torch.tensor(np.stack([x["target_probs"] for x in batch]), dtype=torch.float)
+    return output
