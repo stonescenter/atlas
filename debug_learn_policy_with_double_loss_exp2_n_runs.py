@@ -26,12 +26,13 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 from utils.plots import *
 from utils.util import gradient_direction_stats
 
-device = torch.device(
-    "cuda" if torch.cuda.is_available()
-    else "cpu"
-)
+if torch.cuda.is_available():
+    dev = 'cuda'
+else:
+    dev = 'cpu'
+    print("Device cuda not available, using cpu")    
 
-print("Device available ", device)
+device = torch.device(dev)
 
 def set_seed(seed=2020):
     random.seed(seed)
@@ -809,7 +810,20 @@ def train_walk_policy(
             # Experiment 3
             elif supervision_mode == "soft":
                 target_probs = batch["target_probs"].float().to(device)
-                #log_probs = F.log_softmax(walk_logits, dim=-1)
+                if target_probs.ndim != 2:
+                    target_probs = target_probs.unsqueeze(0)
+                if target_probs.shape[1] != walk_logits.shape[1]:
+                    target_probs = target_probs[:, : walk_logits.shape[1]]
+                    if target_probs.shape[1] < walk_logits.shape[1]:
+                        pad = torch.zeros(
+                            (target_probs.shape[0], walk_logits.shape[1] - target_probs.shape[1]),
+                            dtype=target_probs.dtype,
+                            device=target_probs.device,
+                        )
+                        target_probs = torch.cat([target_probs, pad], dim=1)
+                valid_mask = pos_mask.to(target_probs.dtype)
+                target_probs = target_probs * valid_mask
+                target_probs = target_probs / (target_probs.sum(dim=-1, keepdim=True) + 1e-12)
                 log_probs = F.log_softmax(walk_logits / temperature, dim=-1)
                 walk_loss = F.kl_div(log_probs, target_probs, reduction="batchmean")
 
@@ -958,139 +972,158 @@ def evaluate_link_prediction(model, loader, device):
     }
 
 PATH_DATASET = '/exp-local/steve/datasets/temporal/ml_preprocess/'
-dataset_name = 'wikipedia'
 
-graph_df = pd.read_csv('{}/ml_{}.csv'.format(PATH_DATASET, dataset_name))
-sources = graph_df.u.values
-destinations = graph_df.i.values
-edge_idxs = graph_df.idx.values
-labels = graph_df.label.values
-timestamps = graph_df.ts.values
+datasets = ['wikipedia', 'enron', 'CollegeMsg', 'mooc', 'reddit']
+datasets = ['enron', 'CollegeMsg', 'mooc', 'reddit']
+datasets = ['mooc', 'reddit']
 
 random.seed(2020)
 
+
 batch_size = 64
 num_neighbors = 30
-#graph_df = graph_df.head(5000)
-val_time, test_time = list(np.quantile(graph_df.ts, [0.70, 0.85]))
-
-train_mask = timestamps <= test_time
-test_mask = timestamps > test_time
-val_mask = np.logical_and(timestamps <= test_time, timestamps > val_time)
-
-train_data = EdgeDataset(sources[train_mask], destinations[train_mask], timestamps[train_mask],
-                    edge_idxs[train_mask], labels[train_mask])
-
-val_data = EdgeDataset(sources[val_mask], destinations[val_mask], timestamps[val_mask],
-                  edge_idxs[val_mask], labels[val_mask])
-
-test_data = EdgeDataset(sources[test_mask], destinations[test_mask], timestamps[test_mask],
-                   edge_idxs[test_mask], labels[test_mask])
-
-graph = GraphStorage(sources, destinations, timestamps)
-PAD_NODE = graph.num_nodes()
-
-max_node_id = max(graph.get_nodes())
-NUM_NODES = graph.num_nodes()
-
-DEBUG = False
-
-print("Num nodes:", NUM_NODES)
-
-if max_node_id < NUM_NODES:
-    NUM_NODES = max_node_id + 1
-
-print("Max : ", max_node_id)
-print("Num nodes:", NUM_NODES)
-
-PAD_NODE = NUM_NODES
-
-sampler = TemporalNeighborSampler(graph, num_neighbors=num_neighbors, pad_node=PAD_NODE)
-
-test_walks = TemporalWalkLinkDataset(test_data, graph, sampler, num_nodes=NUM_NODES)
-test_loader = DataLoader(test_walks, batch_size=batch_size, shuffle=False, num_workers=4, collate_fn=collate_temporal_walk_link)
-
-
 epochs = 10
-lambda_walks = [0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
-lambda_links = [1.0, 0.9, 0.7, 0.5, 0.3, 0.1, 0.0]
-
-#Test AUC-ROC: 0.9495 | AP: 0.9363
-lambda_walks = [0.3] 
+lambda_walks = [0.3]
 lambda_links = [0.7]
-
 modes = ["earliest", "sampled", "soft"]
+
 modes = ["soft"]
 
-experiment = "results/exp2"
-os.makedirs(experiment, exist_ok=True)
+experiment_root = "results/exp2"
+os.makedirs(experiment_root, exist_ok=True)
 
 n_runs = 5
 optimizer = None
 
-for mode in modes:
-    train_dataset = TemporalWalkSupervisionDataset(train_data, graph, sampler, num_nodes=NUM_NODES, supervision_mode=mode)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_temporal_walk_link)
-    
-    for lambda_walk, lambda_link in zip(lambda_walks, lambda_links):
-        auc_scores = []
-        ap_scores = []
+for dataset_name in datasets:
+    data_file = os.path.join(PATH_DATASET, f"ml_{dataset_name}.csv")
+    if not os.path.exists(data_file):
+        print(f"Skipping dataset {dataset_name}: file not found at {data_file}")
+        continue
 
-        print(f"Model params:")
-        print(f"\tlambda_walk: {lambda_walk}, lambda_link: {lambda_link}")
-        print(f"\tsupervision_mode: {mode}")
+    print(f"\n=== Dataset: {dataset_name} ===")
+    graph_df = pd.read_csv(data_file)
+    sources = graph_df.u.values
+    destinations = graph_df.i.values
+    edge_idxs = graph_df.idx.values
+    labels = graph_df.label.values
+    timestamps = graph_df.ts.values
 
-        for run_idx in range(n_runs):
-            set_seed(2020 + run_idx)
-            print(f"\nRun {run_idx + 1}/{n_runs}...")
+    val_time, test_time = list(np.quantile(graph_df.ts, [0.70, 0.85]))
 
+    train_mask = timestamps <= test_time
+    test_mask = timestamps > test_time
+    val_mask = np.logical_and(timestamps <= test_time, timestamps > val_time)
 
+    train_data = EdgeDataset(
+        sources[train_mask],
+        destinations[train_mask],
+        timestamps[train_mask],
+        edge_idxs[train_mask],
+        labels[train_mask],
+    )
 
-            model = TemporalWalkModel(
-                num_nodes=NUM_NODES,
-                embedding_dim=32,
-                time_dim=16,
-                pad_node=PAD_NODE,
-                debug=False,
-            ).to(device)
+    test_data = EdgeDataset(
+        sources[test_mask],
+        destinations[test_mask],
+        timestamps[test_mask],
+        edge_idxs[test_mask],
+        labels[test_mask],
+    )
 
-            optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)
-            link_criterion = nn.BCEWithLogitsLoss()
+    graph = GraphStorage(sources, destinations, timestamps)
+    max_node_id = max(graph.get_nodes())
+    NUM_NODES = int(max_node_id) + 1
+    PAD_NODE = NUM_NODES
 
-            path_plot = os.path.join(
-                experiment,
-                f"gradient_cosine_walk_{mode}_{lambda_walk}_link_{lambda_link}_run_{run_idx}.png",
-            )
+    print("Num nodes:", NUM_NODES)
+    print("Max : ", max_node_id)
 
-            train_walk_policy(
-                model,
-                train_loader,
-                device=device,
-                optimizer=optimizer,
-                link_criterion=link_criterion,
-                epochs=epochs,
-                lambda_walk=lambda_walk,
-                lambda_link=lambda_link,
-                supervision_mode=mode,
-                track_gradients=True,
-                gradient_plot_path=path_plot,
-                gradient_every=10,
-                temperature=1.2,
-                label_smoothing=0.05,
-                debug=False,
-            )
-            metrics = evaluate_link_prediction(model, test_loader, device)
-            auc_scores.append(metrics["auc_roc"])
-            ap_scores.append(metrics["ap"])
+    sampler = TemporalNeighborSampler(graph, num_neighbors=num_neighbors, pad_node=PAD_NODE)
+    test_walks = TemporalWalkLinkDataset(test_data, graph, sampler, num_nodes=NUM_NODES)
+    test_loader = DataLoader(
+        test_walks,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        collate_fn=collate_temporal_walk_link,
+    )
 
-        mean_auc = np.mean(auc_scores)
-        std_auc = np.std(auc_scores, ddof=1)
-        mean_ap = np.mean(ap_scores)
-        std_ap = np.std(ap_scores, ddof=1)
+    experiment = os.path.join(experiment_root, dataset_name)
+    os.makedirs(experiment, exist_ok=True)
 
-        print(f"Summary for {mode} | lambda_walk={lambda_walk} | lambda_link={lambda_link}")
-        print(f"  AUC mean ± std: {mean_auc:.4f} ± {std_auc:.4f}")
-        print(f"  AP  mean ± std: {mean_ap:.4f} ± {std_ap:.4f}")
+    for mode in modes:
+        train_dataset = TemporalWalkSupervisionDataset(
+            train_data,
+            graph,
+            sampler,
+            num_nodes=NUM_NODES,
+            supervision_mode=mode,
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=collate_temporal_walk_link,
+        )
+
+        for lambda_walk, lambda_link in zip(lambda_walks, lambda_links):
+            auc_scores = []
+            ap_scores = []
+
+            print(f"Model params:")
+            print(f"\tlambda_walk: {lambda_walk}, lambda_link: {lambda_link}")
+            print(f"\tsupervision_mode: {mode}")
+
+            for run_idx in range(n_runs):
+                set_seed(2020 + run_idx)
+                print(f"\nRun {run_idx + 1}/{n_runs}...")
+
+                model = TemporalWalkModel(
+                    num_nodes=NUM_NODES,
+                    embedding_dim=32,
+                    time_dim=16,
+                    pad_node=PAD_NODE,
+                    debug=False,
+                ).to(device)
+
+                optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)
+                link_criterion = nn.BCEWithLogitsLoss()
+
+                path_plot = os.path.join(
+                    experiment,
+                    f"gradient_cosine_walk_{mode}_{lambda_walk}_link_{lambda_link}_run_{run_idx}.png",
+                )
+
+                train_walk_policy(
+                    model,
+                    train_loader,
+                    device=device,
+                    optimizer=optimizer,
+                    link_criterion=link_criterion,
+                    epochs=epochs,
+                    lambda_walk=lambda_walk,
+                    lambda_link=lambda_link,
+                    supervision_mode=mode,
+                    track_gradients=False,
+                    gradient_plot_path=path_plot,
+                    gradient_every=10,
+                    temperature=1.2,
+                    label_smoothing=0.05,
+                    debug=False,
+                )
+                metrics = evaluate_link_prediction(model, test_loader, device)
+                auc_scores.append(metrics["auc_roc"])
+                ap_scores.append(metrics["ap"])
+
+            mean_auc = np.mean(auc_scores)
+            std_auc = np.std(auc_scores, ddof=1)
+            mean_ap = np.mean(ap_scores)
+            std_ap = np.std(ap_scores, ddof=1)
+
+            print(f"Summary for {dataset_name} | {mode} | lambda_walk={lambda_walk} | lambda_link={lambda_link}")
+            print(f"  AUC mean ± std: {mean_auc:.4f} ± {std_auc:.4f}")
+            print(f"  AP  mean ± std: {mean_ap:.4f} ± {std_ap:.4f}")
 
 
 # Multi-Task Temporal Walk Policy Network for Temporal Link Prediction (Temporal Walk Policy + Link Prediction)
