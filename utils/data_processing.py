@@ -58,6 +58,28 @@ def temporal_target_distribution(times, mask, current_time, beta=0.1):
     probs = weights / total
     return probs
 
+
+def _valid_target_index(mask, probs=None, supervision_mode="earliest"):
+    valid_positions = np.flatnonzero(mask)
+    if len(valid_positions) == 0:
+        return None
+
+    if supervision_mode == "earliest":
+        return int(valid_positions[0])
+
+    if supervision_mode == "sampled":
+        if probs is None:
+            return int(valid_positions[0])
+        valid_probs = probs[valid_positions].astype(np.float32)
+        total = valid_probs.sum()
+        if total <= 0:
+            return int(valid_positions[0])
+        valid_probs = valid_probs / total
+        return int(valid_positions[np.random.choice(len(valid_positions), p=valid_probs)])
+
+    return None
+
+
 class ContextBase(Dataset):
     def __init__(self, graph, sampler):
         self.examples = []
@@ -158,7 +180,13 @@ class TemporalWalkSupervisionDataset(ContextBase):
             # Experiment 1: earliest future neighbor
             # ---------------------------------------
             if supervision_mode == "earliest":
-                example["target_idx"] = 0
+                target_idx = _valid_target_index(
+                    pos_context["mask"],
+                    supervision_mode="earliest",
+                )
+                if target_idx is None:
+                    continue
+                example["target_idx"] = target_idx
 
             # ---------------------------------------
             # Experiment 2: sampled temporal target
@@ -175,11 +203,14 @@ class TemporalWalkSupervisionDataset(ContextBase):
                 if probs is None:
                     continue
 
-                target_idx = np.random.choice(
-                    len(probs),
-                    p=probs,
+                target_idx = _valid_target_index(
+                    pos_context["mask"],
+                    probs=probs,
+                    supervision_mode="sampled",
                 )
-                example["target_probs"] = probs
+                if target_idx is None:
+                    continue
+                example["target_probs"] = probs.astype(np.float32)
                 example["target_idx"] = int(target_idx)
 
             # ---------------------------------------
@@ -232,15 +263,15 @@ class TemporalWalkSupervisionDataset(ContextBase):
         example = self.examples[idx]
 
         if self.supervision_mode == "sampled":
-
             probs = example["target_probs"]
-
-            target = np.random.choice(
-                len(probs),
-                p=probs,
+            mask = example["pos_mask"]
+            target = _valid_target_index(
+                mask,
+                probs=probs,
+                supervision_mode="sampled",
             )
-
-            example["target_idx"] = target
+            if target is not None:
+                example["target_idx"] = target
 
         return example
     

@@ -803,7 +803,11 @@ def train_walk_policy(
             # Experiments 1 and 2
             if supervision_mode in {"earliest", "sampled"}:
                 target_idx = batch["target_idx"].long().to(device)
-                #walk_loss = F.cross_entropy(walk_logits, target_idx)
+                target_idx = target_idx.clamp(min=0, max=walk_logits.size(1) - 1)
+                has_valid = pos_mask.any(dim=1)
+                if has_valid.any():
+                    first_valid = pos_mask.long().argmax(dim=1)
+                    target_idx = torch.where(has_valid, target_idx, first_valid.to(device))
                 walk_loss = F.cross_entropy(walk_logits / temperature, target_idx, label_smoothing=label_smoothing)
 
             # Experiment 3
