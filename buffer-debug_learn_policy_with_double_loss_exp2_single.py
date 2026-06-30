@@ -631,6 +631,8 @@ if __name__ == "__main__":
     optimizer = None
     link_criterion = nn.BCEWithLogitsLoss()
 
+
+    
     for mode in modes:
         train_dataset = TemporalWalkSupervisionDataset(train_data, graph, sampler, num_nodes=NUM_NODES, supervision_mode=mode)
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_temporal_walk_link)
