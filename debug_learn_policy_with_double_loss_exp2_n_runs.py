@@ -958,6 +958,8 @@ def evaluate_link_prediction(model, loader, device):
         all_scores.append(scores.cpu())
         all_labels.append(labels.cpu())
 
+    print("Scores:", len(all_scores))
+    print("Labels:", len(all_labels))
     y_score = torch.cat(all_scores).numpy()
     y_true = torch.cat(all_labels).numpy()
 
@@ -975,7 +977,7 @@ PATH_DATASET = '/exp-local/steve/datasets/temporal/ml_preprocess/'
 
 datasets = ['wikipedia', 'enron', 'CollegeMsg', 'mooc', 'reddit']
 datasets = ['enron', 'CollegeMsg', 'mooc', 'reddit']
-datasets = ['mooc', 'reddit']
+datasets = ['wikipedia']
 
 random.seed(2020)
 
@@ -1011,9 +1013,16 @@ for dataset_name in datasets:
 
     val_time, test_time = list(np.quantile(graph_df.ts, [0.70, 0.85]))
 
-    train_mask = timestamps <= test_time
+    #train_mask = timestamps <= test_time
+    #test_mask = timestamps > test_time
+    #val_mask = np.logical_and(timestamps <= test_time, timestamps > val_time)
+    
+    # much better configuration for training, validation, and testing splits 
+    # means training has access to events occurring between 70% and 85% of the timeline.
+    # the previous configurarion has already seen much more recent interactions than intended
+    train_mask = timestamps <= val_time
+    val_mask = (timestamps > val_time) & (timestamps <= test_time)
     test_mask = timestamps > test_time
-    val_mask = np.logical_and(timestamps <= test_time, timestamps > val_time)
 
     train_data = EdgeDataset(
         sources[train_mask],
@@ -1031,7 +1040,14 @@ for dataset_name in datasets:
         labels[test_mask],
     )
 
-    graph = GraphStorage(sources, destinations, timestamps)
+    #graph = GraphStorage(sources, destinations, timestamps)
+    #  Build graph ONLY from training edges
+    graph = GraphStorage(
+        sources[train_mask],
+        destinations[train_mask],
+        timestamps[train_mask]
+    )
+
     max_node_id = max(graph.get_nodes())
     NUM_NODES = int(max_node_id) + 1
     PAD_NODE = NUM_NODES
@@ -1040,7 +1056,9 @@ for dataset_name in datasets:
     print("Max : ", max_node_id)
 
     sampler = TemporalNeighborSampler(graph, num_neighbors=num_neighbors, pad_node=PAD_NODE)
+    # we use train graph
     test_walks = TemporalWalkLinkDataset(test_data, graph, sampler, num_nodes=NUM_NODES)
+    print("test_walks", len(test_walks))
     test_loader = DataLoader(
         test_walks,
         batch_size=batch_size,
@@ -1048,7 +1066,8 @@ for dataset_name in datasets:
         num_workers=4,
         collate_fn=collate_temporal_walk_link,
     )
-
+    print("test_loader:", len(test_loader))
+    
     experiment = os.path.join(experiment_root, dataset_name)
     os.makedirs(experiment, exist_ok=True)
 
