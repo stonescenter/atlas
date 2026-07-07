@@ -96,6 +96,23 @@ class GraphStorage(object):
 
         return neighbors
     
+    def edge_exists_before(self, src, dst, time):
+        """
+        Check whether an edge between src and dst exists with timestamp < time.
+
+        Args:
+            src: Source node.
+            dst: Destination node.
+            time: Time threshold (exclusive).
+
+        Returns:
+            True if the edge exists before the given time, otherwise False.
+        """
+        for neighbor, edge_time in self.adj_list.get(src, []):
+            if neighbor == dst and edge_time < time:
+                return True
+        return False
+
     def get_neighbors_array(self, node_id, include_edge_weight=False):
 
         neighbors = []
