@@ -233,6 +233,15 @@ class TemporalWalkSupervisionDataset(ContextBase):
             self.examples.append(example)
 
     def sample_negative_node(self, src, dst, ts=None, pool_size=16):
+        """
+            the negative node is likely to be:
+
+            a neighbor of the true destination dst;
+            not equal to src or dst;
+            degree-similar to dst.
+
+            Conceptually, it creates a degree-aware hard negative.
+        """
         if self.num_nodes <= 0:
             return int(dst)
         seen = {src, dst}
@@ -240,12 +249,19 @@ class TemporalWalkSupervisionDataset(ContextBase):
             candidate_nodes = set(self.graph.get_neighbors(dst, undirected=True, unique=True))
         else:
             candidate_nodes = set(self.graph.get_neighbors(dst, timestamp=ts, undirected=True, unique=True))
-        candidate_nodes = [node for node in candidate_nodes if node not in seen]
+
+        # instead of random negatives, it samples nodes structurally close to dst.
+        # candidate_nodes = [node for node in candidate_nodes if node not in seen]
+        # we check if the edge exists before the current timestamp, and if it does, we exclude it from the candidate pool.
+        candidate_nodes = [node for node in candidate_nodes if node not in seen and not self.graph.edge_exists_before(src, node, ts)]
+        
+        #It limits the candidate pool to at most 16 nodes.
         if len(candidate_nodes) > pool_size:
             candidate_nodes = list(np.random.choice(candidate_nodes, size=pool_size, replace=False))
         if not candidate_nodes:
             return int(dst)
 
+        # Nodes with degree similar to dst receive higher probability.
         dst_degree = self.graph.get_degree(dst)
         weights = np.ones(len(candidate_nodes), dtype=np.float32)
         for idx, node in enumerate(candidate_nodes):
@@ -366,6 +382,7 @@ class TemporalWalkLinkDataset(ContextBase):
                 neg_dst = np.random.randint(0, num_nodes)
                 tries += 1
 
+            # se nao tenho contexto continuo
             neg = self.build_context(neg_dst, ts)
             if neg is None:
                 continue
