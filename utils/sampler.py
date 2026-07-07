@@ -64,7 +64,10 @@ class TemporalNeighborSampler:
       return neighbors, times
 
     def sample_k(self, node_id, current_time, is_forward=True):
-
+        '''
+            Returns the K nearest neighbors of a node in the temporal graph,
+            along with their timestamps > , < current_time and a validity mask.
+        '''
         neighbors, times = self.graph.get_neighbors_array(
             node_id,
             include_edge_weight=True,
