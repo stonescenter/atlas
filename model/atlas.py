@@ -83,9 +83,6 @@ class TemporalAttentionLayer(nn.Module):
 
         return e_uv
 
-
-
-
 # ============================================================
 # Temporal Link Predictor
 # ============================================================
@@ -138,7 +135,7 @@ class TemporalLinkPredictor(nn.Module):
         return score
     
 
-class TemporalWalkModel(nn.Module):
+class TemporalWalkEncoder(nn.Module):
     def __init__(
         self,
         num_nodes,

@@ -25,7 +25,7 @@ from utils.data_processing import collate_temporal_walk, collate_temporal_walk_l
 from sklearn.metrics import roc_auc_score, average_precision_score
 from utils.plots import *
 from utils.util import gradient_direction_stats
-from model.atlas import TemporalWalkModel
+from model.atlas import TemporalWalkEncoder
 
 if torch.cuda.is_available():
     dev = 'cuda'
@@ -183,156 +183,6 @@ class TemporalTransitionModel(nn.Module):
         logits = self.attn(z).squeeze(-1)
 
         return logits
-    
-class TemporalWalkEncoder(nn.Module):
-
-    def __init__(
-        self,
-        num_nodes,
-        embedding_dim=64,
-        time_dim=32,
-        hidden_dim=128,
-        pad_node=None,
-        debug = False
-    ):
-        super().__init__()
-
-        self.embedding = nn.Embedding(
-            num_nodes + 1,
-            embedding_dim,
-            padding_idx=pad_node,
-        )
-
-        self.time_encoder = TimeEncoder(
-            time_dim
-        )
-
-        temporal_dim = 2 * time_dim
-
-        input_dim = (
-            1 +                    # structural
-            temporal_dim +         # time encoding
-            embedding_dim +        # h_prev * h_next
-            embedding_dim +        # h_curr * h_next
-            3 * embedding_dim      # h_prev,h_curr,h_next
-        )
-
-        self.encoder = nn.Sequential(
-            nn.Linear(
-                input_dim,
-                hidden_dim
-            ),
-            nn.ReLU(),
-            nn.Linear(
-                hidden_dim,
-                hidden_dim
-            ),
-            nn.ReLU(),
-        )
-
-        self.debug = debug
-
-    def structural_score(
-        self,
-        deg_current,
-        deg_neighbor,
-    ):
-        deg_current = deg_current.unsqueeze(1)
-
-        return (
-            1.0 /
-            torch.sqrt(
-                deg_current * deg_neighbor + 1e-8
-            )
-        ).unsqueeze(-1)
-
-    def forward(
-        self,
-        previous_nodes,
-        current_nodes,
-        neighbor_nodes,
-        deg_current,
-        deg_neighbors,
-        delta_t,
-        mask=None,
-    ):
-        """
-        previous_nodes : [B]
-        current_nodes  : [B]
-
-        neighbor_nodes : [B,K]
-
-        deg_current    : [B]
-        deg_neighbors  : [B,K]
-
-        delta_t        : [B,K]
-
-        returns:
-            z_walk : [B,K,H]
-        """
-
-        B, K = neighbor_nodes.shape
-
-        h_prev = self.embedding(
-            previous_nodes
-        )
-
-        h_curr = self.embedding(
-            current_nodes
-        )
-
-        h_next = self.embedding(
-            neighbor_nodes
-        )
-
-        h_prev = (
-            h_prev
-            .unsqueeze(1)
-            .expand(-1, K, -1)
-        )
-
-        h_curr = (
-            h_curr
-            .unsqueeze(1)
-            .expand(-1, K, -1)
-        )
-
-        structural = torch.log(
-            self.structural_score(
-                deg_current,
-                deg_neighbors
-            ) + 1e-8
-        )
-
-        temporal = self.time_encoder(
-            delta_t
-        )
-
-        prev_next = h_prev * h_next
-        curr_next = h_curr * h_next
-
-        x = torch.cat(
-            [
-                structural,
-                temporal,
-                prev_next,
-                curr_next,
-                h_prev,
-                h_curr,
-                h_next,
-            ],
-            dim=-1,
-        )
-
-        z_walk = self.encoder(x)
-
-        if mask is not None:
-            z_walk = z_walk.masked_fill(
-                ~mask.unsqueeze(-1),
-                0.0
-            )
-
-        return z_walk
 
 class TemporalLinkPredictor(nn.Module):
 
@@ -755,8 +605,8 @@ def evaluate_link_prediction(model, loader, device):
 PATH_DATASET = '/exp-local/steve/datasets/temporal/ml_preprocess/'
 
 datasets = ['wikipedia', 'enron', 'CollegeMsg', 'mooc', 'reddit']
-datasets = ['enron', 'CollegeMsg', 'mooc', 'reddit']
-datasets = ['wikipedia']
+#datasets = ['enron', 'CollegeMsg', 'mooc', 'reddit']
+#datasets = ['wikipedia']
 
 random.seed(2020)
 
@@ -878,7 +728,7 @@ for dataset_name in datasets:
                 set_seed(2020 + run_idx)
                 print(f"\nRun {run_idx + 1}/{n_runs}...")
 
-                model = TemporalWalkModel(
+                model = TemporalWalkEncoder(
                     num_nodes=NUM_NODES,
                     embedding_dim=32,
                     time_dim=16,
