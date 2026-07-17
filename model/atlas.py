@@ -6,6 +6,43 @@ import numpy as np
 
 from .time_encoder import TimeEncoder
 
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Union
+
+class AttentionPooling(nn.Module):
+    def __init__(self, embedding_dim: int):
+        super().__init__()
+
+        # Produces one attention score for each input embedding
+        self.attention = nn.Linear(embedding_dim, 1)
+
+    def forward(self, x: torch.Tensor, mask: Union[torch.Tensor, None] = None):
+        """
+        x:
+            Shape [batch_size, num_items, embedding_dim]
+
+        mask:
+            Shape [batch_size, num_items]
+            True for valid items and False for padding.
+        """
+
+        # [B, K, D] -> [B, K]
+        scores = self.attention(x).squeeze(-1)
+
+        if mask is not None:
+            scores = scores.masked_fill(~mask, float("-inf"))
+
+        # Attention weights over the K items
+        weights = F.softmax(scores, dim=-1)
+
+        # Weighted sum: [B, K, 1] * [B, K, D] -> [B, D]
+        pooled = torch.sum(weights.unsqueeze(-1) * x, dim=1)
+
+        return pooled, weights
+    
 # ============================================================
 # Temporal Attention Layer
 # ============================================================
@@ -82,6 +119,9 @@ class TemporalAttentionLayer(nn.Module):
         e_uv = self.attn(z).squeeze(-1)
 
         return e_uv
+
+
+
 
 # ============================================================
 # Temporal Link Predictor
@@ -179,6 +219,7 @@ class TemporalWalkEncoder(nn.Module):
 
         # Attention pooling for link prediction
         self.pool_attn = nn.Linear(hidden_dim, 1)
+        #self.pool_attn = AttentionPooling(hidden_dim)
 
         # Link prediction head: predicts whether edge exists
         self.link_head = nn.Sequential(
@@ -267,8 +308,6 @@ class TemporalWalkEncoder(nn.Module):
             [
                 structural,
                 temporal,
-                #prev_next,
-                #curr_next,
                 trajetory,
                 h_prev_exp,
                 h_curr_exp,
@@ -352,15 +391,9 @@ class TemporalWalkEncoder(nn.Module):
 
         # Output 2: temporal edge prediction
         z_pool = self.pool_walks(z_walk, mask)            # [B,H]
+        #z_pool = self.pool_attn(z_walk, mask)            # [B,H]
 
-        edge_repr = torch.cat(
-            [
-                z_pool,
-                h_prev,
-                h_curr,
-            ],
-            dim=-1,
-        )
+        edge_repr = torch.cat([z_pool, h_prev, h_curr], dim=-1,)  # [B,H+2*D])
 
         edge_score = self.link_head(edge_repr).squeeze(-1)  # [B]
 
