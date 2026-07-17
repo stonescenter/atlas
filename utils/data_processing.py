@@ -79,6 +79,109 @@ def _valid_target_index(mask, probs=None, supervision_mode="earliest"):
 
     return None
 
+class ObservedTrajectoryIndex:
+    """
+    Data-driven supervision class
+        We used new
+            q_{obs}(x_i \mid u,v) = \frac{N(u,v,x_i)}{\sum_{x_j \in \mathcal{C}(v,t)} N(u,v,x_j)},
+        Instead of exponencial decay assumption
+
+    Builds empirical continuation counts for temporal triples:
+
+        u --t1--> v --t2--> x,  with t2 > t1
+
+    The resulting counts estimate q_obs(x | u, v).
+    """
+
+    def __init__(
+        self,
+        sources,
+        destinations,
+        timestamps,
+        max_horizon=None,
+        max_continuations=None,
+    ):
+        self.counts = defaultdict(lambda: defaultdict(int))
+
+        events = sorted(
+            zip(sources, destinations, timestamps),
+            key=lambda item: item[2],
+        )
+
+        # Incident temporal events for every node.
+        incident = defaultdict(list)
+
+        for src, dst, ts in events:
+            incident[int(src)].append((int(dst), float(ts)))
+            incident[int(dst)].append((int(src), float(ts)))
+
+        for u, v, t_uv in events:
+            u = int(u)
+            v = int(v)
+            t_uv = float(t_uv)
+
+            n_added = 0
+
+            for x, t_vx in incident[v]:
+                if t_vx <= t_uv:
+                    continue
+
+                if max_horizon is not None:
+                    if t_vx - t_uv > max_horizon:
+                        break
+
+                # Optional: avoid immediately returning to u.
+                if x == u:
+                    continue
+
+                self.counts[(u, v)][int(x)] += 1
+                n_added += 1
+
+                if (
+                    max_continuations is not None
+                    and n_added >= max_continuations
+                ):
+                    break
+
+    def get_distribution(
+        self,
+        previous_node,
+        current_node,
+        candidate_nodes,
+        mask,
+        smoothing=0.0,
+    ):
+        """
+        Returns q_obs over the padded candidate set.
+        """
+
+        probs = np.zeros(
+            len(candidate_nodes),
+            dtype=np.float32,
+        )
+
+        continuation_counts = self.counts.get(
+            (int(previous_node), int(current_node)),
+            {},
+        )
+
+        for idx, candidate in enumerate(candidate_nodes):
+            if not mask[idx]:
+                continue
+
+            probs[idx] = float(
+                continuation_counts.get(int(candidate), 0)
+            )
+
+        if smoothing > 0:
+            probs[mask] += smoothing
+
+        total = probs.sum()
+
+        if total <= 0:
+            return None
+
+        return probs / total
 
 class ContextBase(Dataset):
     def __init__(self, graph, sampler):
@@ -290,7 +393,159 @@ class TemporalWalkSupervisionDataset(ContextBase):
                 example["target_idx"] = target
 
         return example
-    
+
+class TemporalWalkSupervisionDataDriven(ContextBase):
+    def __init__(
+        self,
+        edge_dataset,
+        graph,
+        sampler,
+        num_nodes,
+        trajectory_index,
+        supervision_mode="observed_hard",
+        smoothing=0.0,
+    ):
+        super().__init__(graph, sampler)
+
+        self.num_nodes = num_nodes
+        self.trajectory_index = trajectory_index
+        self.supervision_mode = supervision_mode
+        self.smoothing = smoothing
+
+        assert supervision_mode in {
+            "observed_hard",
+            "observed_sampled",
+            "observed_soft",
+        }
+
+        for sample in edge_dataset:
+            src = int(sample["src"])
+            dst = int(sample["dst"])
+            ts = float(sample["ts"])
+
+            pos_context = self.build_context(
+                node=dst,
+                ts=ts,
+            )
+
+            if pos_context is None:
+                continue
+
+            target_probs = trajectory_index.get_distribution(
+                previous_node=src,
+                current_node=dst,
+                candidate_nodes=pos_context["neighbors"],
+                mask=pos_context["mask"],
+                smoothing=smoothing,
+            )
+
+            # No observed continuation for this context.
+            if target_probs is None:
+                continue
+
+            neg_dst = self.sample_negative_node(
+                src=src,
+                dst=dst,
+                ts=ts,
+            )
+
+            neg_context = self.build_context(
+                node=neg_dst,
+                ts=ts,
+            )
+
+            if neg_context is None:
+                continue
+
+            example = {
+                "src": src,
+                "dst": dst,
+                "neg_dst": neg_dst,
+
+                "pos_neighbors": pos_context["neighbors"],
+                "pos_deg_current": pos_context["deg_current"],
+                "pos_deg_neighbors": pos_context["deg_neighbors"],
+                "pos_delta_t": pos_context["delta_t"],
+                "pos_mask": pos_context["mask"],
+
+                "neg_neighbors": neg_context["neighbors"],
+                "neg_deg_current": neg_context["deg_current"],
+                "neg_deg_neighbors": neg_context["deg_neighbors"],
+                "neg_delta_t": neg_context["delta_t"],
+                "neg_mask": neg_context["mask"],
+
+                "target_probs": target_probs.astype(np.float32),
+            }
+
+            if supervision_mode == "observed_hard":
+                example["target_idx"] = int(
+                    np.argmax(target_probs)
+                )
+
+            elif supervision_mode == "observed_sampled":
+                example["target_idx"] = int(
+                    np.random.choice(
+                        len(target_probs),
+                        p=target_probs,
+                    )
+                )
+
+            self.examples.append(example)
+
+    def sample_negative_node(
+        self,
+        src,
+        dst,
+        ts=None,
+        pool_size=16,
+    ):
+        seen = {src, dst}
+
+        candidate_nodes = set(
+            self.graph.get_neighbors(
+                dst,
+                timestamp=ts,
+                undirected=True,
+                unique=True,
+            )
+        )
+
+        candidate_nodes = [
+            node
+            for node in candidate_nodes
+            if node not in seen
+            and not self.graph.edge_exists_before(src, node, ts)
+        ]
+
+        if len(candidate_nodes) > pool_size:
+            candidate_nodes = list(
+                np.random.choice(
+                    candidate_nodes,
+                    size=pool_size,
+                    replace=False,
+                )
+            )
+
+        if not candidate_nodes:
+            return int(dst)
+
+        return int(np.random.choice(candidate_nodes))
+
+    def __getitem__(self, idx):
+        example = self.examples[idx].copy()
+
+        if self.supervision_mode == "observed_sampled":
+            probs = example["target_probs"]
+
+            example["target_idx"] = int(
+                np.random.choice(
+                    len(probs),
+                    p=probs,
+                )
+            )
+
+        return example
+      
 class TemporalWalkContinuationDataset(torch.utils.data.Dataset):
 
     def __init__(self, edge_dataset, graph, sampler):
@@ -413,6 +668,7 @@ class TemporalWalkLinkDataset(ContextBase):
 
     def __getitem__(self, idx):
         return self.examples[idx]
+
     
 '''
  Precomputed dst, neighbors, graph.get_degree()
