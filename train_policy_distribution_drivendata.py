@@ -522,7 +522,7 @@ def train_walk_policy(
     epochs=20,
     lambda_walk=0.5,  
     lambda_link=0.5,    
-    supervision_mode="earliest",
+    supervision_mode="observed_hard",
     track_gradients=False,
     gradient_plot_path=None,
     temperature=1.0, 
@@ -530,10 +530,17 @@ def train_walk_policy(
     gradient_every=1, 
     debug=False
 ):
+    '''
     assert supervision_mode in {
         "earliest",
         "sampled",
         "soft",
+    }
+    '''
+    assert supervision_mode in {
+        "observed_hard",
+        "observed_sampled",
+        "observed_soft",
     }
 
     gradient_history = []
@@ -581,13 +588,22 @@ def train_walk_policy(
             walk_logits = walk_logits.masked_fill(~pos_mask, -1e9)
 
             # Experiments 1 and 2
-            if supervision_mode in {"earliest", "sampled"}:
+            #if supervision_mode in {"earliest", "sampled"}:
+            if supervision_mode in {"observed_hard", "observed_sampled"}:
                 target_idx = batch["target_idx"].long().to(device)
-                #walk_loss = F.cross_entropy(walk_logits, target_idx)
-                walk_loss = F.cross_entropy(walk_logits / temperature, target_idx, label_smoothing=label_smoothing)
+                # For the observed hard/sample modes, the supervision target is already
+                # a categorical target derived from empirical counts. We keep the loss hard
+                # and avoid extra label smoothing here, which otherwise dilutes the signal.
+                walk_loss = F.cross_entropy(
+                    walk_logits / temperature,
+                    target_idx,
+                    label_smoothing=label_smoothing,
+                )
 
             # Experiment 3
-            elif supervision_mode == "soft":
+            #elif supervision_mode == "soft":
+            elif supervision_mode == "observed_soft":
+
                 target_probs = batch["target_probs"].float().to(device)
                 if target_probs.ndim != 2:
                     target_probs = target_probs.unsqueeze(0)
@@ -760,21 +776,23 @@ def evaluate_link_prediction(model, loader, device):
 PATH_DATASET = '/exp-local/steve/datasets/temporal/ml_preprocess/'
 
 datasets = ['wikipedia', 'enron', 'collegemsg', 'mooc', 'reddit']
-datasets = ['wikipedia']
+datasets = ['enron', 'collegemsg', 'mooc', 'reddit']
+datasets = ['wikipedia', 'enron']
 
 random.seed(2020)
 
-
 batch_size = 64
 num_neighbors = 30
-epochs = 10
+epochs = 20
 lambda_walks = [0.3]
 lambda_links = [0.7]
-modes = ["earliest", "sampled", "soft"]
+#modes = ["earliest", "sampled", "soft"]
+#modes = ["soft"]
 
-modes = ["soft"]
+modes = ["observed_hard", "observed_sampled", "observed_soft"]
+modes = ["observed_soft"]
 
-experiment_root = "results/exp2"
+experiment_root = "results/exp"
 os.makedirs(experiment_root, exist_ok=True)
 
 n_runs = 5
@@ -794,7 +812,7 @@ for dataset_name in datasets:
     labels = graph_df.label.values
     timestamps = graph_df.ts.values
 
-    graph_df = graph_df.head(1000)
+    #graph_df = graph_df.head(1000)
     val_time, test_time = list(np.quantile(graph_df.ts, [0.70, 0.85]))
 
     #train_mask = timestamps <= test_time
@@ -884,7 +902,7 @@ for dataset_name in datasets:
             sampler=sampler_train,
             num_nodes=NUM_NODES,
             trajectory_index=trajectory_index,
-            supervision_mode="observed_soft",
+            supervision_mode=mode,
             smoothing=1e-3,
         )
 
@@ -898,8 +916,8 @@ for dataset_name in datasets:
         for lambda_walk, lambda_link in zip(lambda_walks, lambda_links):
             auc_scores = []
             ap_scores = []
-
-            print(f"Model params:")
+            
+            print(f"\nModel params:")
             print(f"\tlambda_walk: {lambda_walk}, lambda_link: {lambda_link}")
             print(f"\tsupervision_mode: {mode}")
 
@@ -937,7 +955,7 @@ for dataset_name in datasets:
                     gradient_plot_path=path_plot,
                     gradient_every=10,
                     temperature=1.2,
-                    label_smoothing=0.05,
+                    label_smoothing=0.0,
                     debug=False,
                 )
                 metrics = evaluate_link_prediction(model, test_loader, device)
