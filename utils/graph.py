@@ -9,11 +9,13 @@ class GraphStorage(object):
         sources,
         destinations,
         timestamps,
+        edge_idxs,
     ):
 
         self.sources = np.asarray(sources)
         self.destinations = np.asarray(destinations)
         self.timestamps = np.asarray(timestamps)
+        self.edge_idxs = np.asarray(edge_idxs)
 
         n = len(sources)
 
@@ -27,14 +29,15 @@ class GraphStorage(object):
 
         self.adj_list = defaultdict(list)
 
-        for src, dst, t in zip(
+        for src, dst, t, eidx in zip(
             self.sources,
             self.destinations,
             self.timestamps,
+            self.edge_idxs,
         ):
 
-            self.adj_list[src].append((dst, t))
-            self.adj_list[dst].append((src, t))
+            self.adj_list[src].append((dst, t, eidx))
+            self.adj_list[dst].append((src, t, eidx))
 
         '''
         for node in self.adj_list:
@@ -108,25 +111,32 @@ class GraphStorage(object):
         Returns:
             True if the edge exists before the given time, otherwise False.
         """
-        for neighbor, edge_time in self.adj_list.get(src, []):
+        for neighbor, edge_time, _ in self.adj_list.get(src, []):
             if neighbor == dst and edge_time < time:
                 return True
         return False
 
-    def get_neighbors_array(self, node_id, include_edge_weight=False):
+    def get_neighbors_array(self, node_id, include_edge_weight=False, include_edge_index=False):
 
         neighbors = []
         times = []
+        edge_idxs = []
         
-        for neighbor, time in self.adj_list[node_id]:
+        for neighbor, time, eidx in self.adj_list[node_id]:
             neighbors.append(neighbor)
             times.append(time)
+            if include_edge_index:
+                edge_idxs.append(-1 if eidx is None else eidx)
 
         outputs = [
             np.asarray(neighbors),
-            np.asarray(times)]
+            np.asarray(times),
+        ]
+
+        if include_edge_index:
+            outputs.append(np.asarray(edge_idxs))
         
-        return outputs if include_edge_weight else np.asarray(neighbors)
+        return outputs if include_edge_weight or include_edge_index else np.asarray(neighbors)
         
     def _get_degree(
         self,

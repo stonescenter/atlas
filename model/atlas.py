@@ -173,8 +173,8 @@ class TemporalLinkPredictor(nn.Module):
         )
 
         return score
-    
 
+ 
 class TemporalWalkEncoder(nn.Module):
     def __init__(
         self,
@@ -228,6 +228,9 @@ class TemporalWalkEncoder(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
+
+        self.log_var_walk = nn.Parameter(torch.zeros(1))
+        self.log_var_link = nn.Parameter(torch.zeros(1))
 
         self.debug = debug
 
@@ -399,4 +402,299 @@ class TemporalWalkEncoder(nn.Module):
 
         return walk_logits, edge_score
 
+
    
+class EdgeFeatureEncoder(nn.Module):    
+    '''
+        Encodes edge features and temporal information into a single laten representation.
+    '''
+    def __init__(
+        self,
+        time_dim,
+        features_dim,
+        output_dim
+    ):
+        super().__init__()
+
+        self.time_encoder = TimeEncoder(dimension=time_dim)
+        self.feature_encoder = nn.Linear(features_dim+time_dim, output_dim)
+
+    def forward(self, delta_t, edge_features):
+
+        time_enc = self.time_encoder(delta_t)
+        x = torch.cat([time_enc, edge_features], dim=1)
+        return self.feature_encoder(x)
+
+class NodeFeatureEncoder(nn.Module):
+    def __init__(
+            self,
+            features_dim: int,
+            output_dim: int,
+            dropout: float = 0.1,
+    ):
+        super().__init__()
+
+        self.encoder = nn.Sequential(
+            nn.Linear(features_dim, output_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(output_dim, output_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, node_features):
+        return self.encoder(node_features)
+    
+class TemporalWalkEncoderFeatures(nn.Module):
+    def __init__(
+        self,
+        node_feature_dim: int,
+        edge_feature_dim: int,
+        node_hidden_dim: int = 64,
+        edge_hidden_dim: int = 64,
+        time_dim: int = 32,
+        hidden_dim: int = 128,
+        dropout: float = 0.1,
+        debug: bool = False,
+    ):
+        super().__init__()
+
+        # Node features embedding layer.
+        self.node_encoder = NodeFeatureEncoder(
+            node_feature_dim=node_feature_dim,
+            output_dim=node_hidden_dim,
+            dropout=dropout,
+        )
+
+        # Shared encoder for the observed and candidate edges.
+        self.edge_encoder = EdgeFeatureEncoder(
+            time_dim=time_dim,
+            edge_feature_dim=edge_feature_dim,
+            output_dim=edge_hidden_dim,
+        )
+        # structural feature
+        structural_dim = 3
+        input_dim = (
+            structural_dim +                       # structural feature
+            3 * node_hidden_dim  + # f_u, f_v, f_x
+            2 * edge_hidden_dim   # e_uv, e_vx
+        )
+
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
+
+        self.walk_head = nn.Linear(hidden_dim, 1)
+
+        self.pool_attn = nn.Linear(hidden_dim, 1)
+
+        # Current edge representation:
+        # pooled future + node u + node v + observed edge uv
+        link_input_dim = (
+            hidden_dim
+            + 2 * node_hidden_dim
+            + edge_hidden_dim
+        )
+
+        self.link_head = nn.Sequential(
+            nn.Linear(link_input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+        self.log_var_walk = nn.Parameter(torch.zeros(1))
+        self.log_var_link = nn.Parameter(torch.zeros(1))
+
+        self.debug = debug
+
+    @staticmethod
+    def structural_info(self, deg_current, deg_neighbors):
+
+        """
+        Calculate the structural feature vector for every candidate edge (v, x_i)
+        deg_current   : [B]
+        deg_neighbors : [B,K]
+
+        returns:
+            structural : [B,K,1]
+        """
+
+        deg_current = deg_current.unsqueeze(1)  # [B,1]
+
+        deg_current = torch.clamp(deg_current, min=1.0)
+        deg_neighbors = torch.clamp(deg_neighbors, min=1.0)
+
+        normalized_score = 1.0 / torch.sqrt(
+            deg_current * deg_neighbors + 1e-8
+        )
+
+        # Individual degree information
+        # new structural features: 
+        # \phi(u, x_i)= [log(1-d(u))| log(1-d(x_i))| log(1/sqrt(d(u)*d(x_i)))]
+        log_deg_current = torch.log1p(deg_current)
+        log_deg_neighbors = torch.log1p(deg_neighbors)
+        log_normalized_score = torch.log(normalized_score  + 1e-8)
+
+        structural = torch.stack([
+            log_deg_current,
+            log_deg_neighbors,
+            log_normalized_score,
+        ], dim=-1)
+
+        return structural.unsqueeze(-1)  # [B,K,1]
+    
+    def encode_walks(
+        self,
+        previous_nodes,
+        current_nodes,
+        neighbor_nodes, # next_neighbors or candidates
+        previous_edge_feat,
+        neighbors_edge_feat,
+        previous_time,
+        neighbors_times,          
+        deg_current,
+        deg_neighbors, 
+        mask=None
+    ):
+        """
+        prev_node  : [B,F_n]
+        curr_node   : [B,F_n]
+        candidate_node_features : [B,K,F_n]
+
+        previous_edge_features  : [B,F_e]
+        candidate_edge_features : [B,K,F_e]
+
+        previous_edge_delta_t   : [B]
+        candidate_edge_delta_t  : [B,K]
+
+        deg_current             : [B]
+        deg_neighbors           : [B,K]
+        mask                    : [B,K]
+        """
+
+        B, K, _ = neighbor_nodes.shape
+
+        # Node representations
+        f_prev = self.node_encoder(previous_nodes) # [B,D_n]
+        f_curr = self.node_encoder(current_nodes) # [B,D_n]
+        f_next = self.node_encoder(neighbor_nodes)
+
+        # expand vectors
+        f_prev = f_prev.unsqueeze(1).expand(-1, K, -1)
+        f_curr = f_curr.unsqueeze(1).expand(-1, K, -1)
+
+        
+        # Encode edge representations previous and neighbors
+        # [cos(time)+sin(time)| features]
+        e_prev = self.edge_encoder(previous_time, previous_edge_feat)  # u-v                                          
+        e_next = self.edge_encoder(neighbors_times, neighbors_edge_feat) # v-x_i
+
+        e_prev = e_prev.unsqueeze(1).expand(-1, K, -1)
+
+        structural = self.structural_info(
+            deg_current,
+            deg_neighbors,
+        )                                           # [B,K,1]
+
+        # u-v-x_i trajectory features:
+        # Z = [f_u | f_v | f_x | e_uv | e_vx]
+        trajectory_features = torch.cat([
+            f_prev,     # previous node u
+            f_curr,     # current node v
+            f_next,     # candidate node x_i
+            structural, # 
+            e_prev,     # observed edge (u,v)
+            e_next,     # candidate edge (v,x_i)
+        ], dim=-1 )
+
+        z_walk = self.encoder(trajectory_features) # [B,K,H]
+
+        if mask is not None:
+            z_walk = z_walk.masked_fill(
+                ~mask.unsqueeze(-1),
+                0.0,
+            )
+
+        if self.debug:
+            print("f_prev:", f_prev.shape)
+            print("f_curr:", f_curr.shape)
+            print("f_next:", f_next.shape)
+            print("e_prev:", e_prev.shape)
+            print("e_next:", e_next.shape)
+            print("trajectory:", trajectory_features.shape)
+            print("z_walk:", z_walk.shape)
+
+        return z_walk, f_prev, f_curr, e_prev, e_next
+
+    def pool_walks(self, z_walk, mask):
+        """
+            For each candidate x_i the encoder produce:
+                z_i = z_uvx_i  
+            pool_walks calculate:
+                a = Wz_i + b
+                scores = softmax(a)
+                z_pool = sum(scores_i*z_i)
+        returns:
+            z_pool : [B,H]
+        """
+
+        attn_logits = self.pool_attn(z_walk).squeeze(-1)  # [B,K]
+
+        attn_logits = attn_logits.masked_fill(~mask, -1e9)
+
+        attn = torch.softmax(attn_logits, dim=-1)         # [B,K]
+
+        z_pool = torch.sum(
+            z_walk * attn.unsqueeze(-1),
+            dim=1,
+        )                                                 # [B,H]
+
+        return z_pool
+
+    def forward(
+        self,
+        previous_node_feat,
+        current_node_feat,
+        neighbor_node_feat,
+        previous_edge_feat,
+        neighbors_edge_feat,
+        current_time,
+        neighbors_times_delta,
+        deg_current,
+        deg_neighbors,
+        mask):
+
+        z_walk, f_prev, f_curr, e_prev, e_next = self.encode_walks(
+            previous_node_feat,
+            current_node_feat,
+            neighbor_node_feat,
+            previous_edge_feat,
+            neighbors_edge_feat,
+            current_time,
+            neighbors_times_delta,
+            deg_current,
+            deg_neighbors,
+            mask,
+        )
+
+        # Auxiliary temporal walk-policy task
+        walk_logits = self.walk_head(z_walk).squeeze(-1)
+
+        walk_logits = walk_logits.masked_fill(
+            ~mask,
+            torch.finfo(walk_logits.dtype).min,
+        )
+
+        # Main link-prediction task
+        z_pool = self.pool_walks(z_walk, mask)
+        # Current edge representation: [z_pool | f_u | f_v | e_prev]
+        edge_repr = torch.cat([z_pool, e_prev], dim=-1)
+        edge_score = self.link_head(edge_repr).squeeze(-1)
+
+        return walk_logits, edge_score
+    

@@ -39,8 +39,7 @@ class TimeEncode(torch.nn.Module):
     output = torch.cos(self.w(t))
 
     return output
-
-
+ 
 class TimeEncoder(nn.Module):
     # Improved version Time Encoding proposed by TGAT
     def __init__(self, dimension):
@@ -50,17 +49,11 @@ class TimeEncoder(nn.Module):
         self.dimension = dimension
         self.w = nn.Linear(1, dimension)
 
-        freq = 1 / 10 ** np.linspace(0, 9, dimension)
+        freq = 1 / 10 ** np.linspace(0, 9, self.dimension, dtype=np.float32)
 
-        self.w.weight = nn.Parameter(
-            torch.from_numpy(freq)
-            .float()
-            .reshape(dimension, 1)
-        )
-
-        self.w.bias = nn.Parameter(
-            torch.zeros(dimension)
-        )
+        #self.w.weight = nn.Parameter(torch.from_numpy(freq).float() .reshape(dimension, 1))
+        self.w.weight = nn.Parameter(torch.from_numpy(freq).float() .reshape(dimension, -1))
+        self.w.bias = nn.Parameter(torch.zeros(self.dimension))
 
     def forward(self, t):
         #if torch.isnan(t).any():
@@ -73,10 +66,7 @@ class TimeEncoder(nn.Module):
 
         t = torch.log1p(t)
         t = t.unsqueeze(-1)
-
         x = self.w(t)
-
-
 
         return torch.cat([torch.cos(x), torch.sin(x)], dim=-1)
     

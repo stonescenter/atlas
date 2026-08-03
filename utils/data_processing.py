@@ -2,6 +2,7 @@ import numpy as np
 import random
 import pandas as pd
 import torch
+from bisect import bisect_right
 from collections import defaultdict
 from torch.utils.data import Dataset
 import torch.nn.functional as F
@@ -103,28 +104,44 @@ class ObservedTrajectoryIndex:
     ):
         self.counts = defaultdict(lambda: defaultdict(int))
 
-        events = sorted(
-            zip(sources, destinations, timestamps),
-            key=lambda item: item[2],
-        )
+        # A stable NumPy sort avoids materializing and sorting one Python tuple
+        # per event. Stability preserves the input order of equal timestamps.
+        sources = np.asarray(sources)
+        destinations = np.asarray(destinations)
+        timestamps = np.asarray(timestamps)
+        event_order = np.argsort(timestamps, kind="stable")
 
-        # Incident temporal events for every node.
+        # Store (timestamp, neighbor), so binary search can jump directly past
+        # the node's history instead of re-scanning it for every edge.
         incident = defaultdict(list)
 
-        for src, dst, ts in events:
-            incident[int(src)].append((int(dst), float(ts)))
-            incident[int(dst)].append((int(src), float(ts)))
+        for event_idx in event_order:
+            src = int(sources[event_idx])
+            dst = int(destinations[event_idx])
+            ts = float(timestamps[event_idx])
+            incident[src].append((ts, dst))
+            incident[dst].append((ts, src))
 
-        for u, v, t_uv in events:
-            u = int(u)
-            v = int(v)
-            t_uv = float(t_uv)
+        counts = self.counts
+        max_timestamp_neighbor = float("inf")
+
+        for event_idx in event_order:
+            u = int(sources[event_idx])
+            v = int(destinations[event_idx])
+            t_uv = float(timestamps[event_idx])
+            v_incident = incident[v]
 
             n_added = 0
 
-            for x, t_vx in incident[v]:
-                if t_vx <= t_uv:
-                    continue
+            # Equal-time events are skipped because continuations must be
+            # strictly later than the observed (u, v) event.
+            first_future = bisect_right(
+                v_incident,
+                (t_uv, max_timestamp_neighbor),
+            )
+
+            for incident_idx in range(first_future, len(v_incident)):
+                t_vx, x = v_incident[incident_idx]
 
                 if max_horizon is not None:
                     if t_vx - t_uv > max_horizon:
@@ -134,7 +151,7 @@ class ObservedTrajectoryIndex:
                 if x == u:
                     continue
 
-                self.counts[(u, v)][int(x)] += 1
+                counts[(u, v)][x] += 1
                 n_added += 1
 
                 if (
@@ -190,10 +207,15 @@ class ContextBase(Dataset):
         self.sampler = sampler
 
     def build_context(self, node, ts):
-        neighbors, times, mask, n_valid = self.sampler.sample_k(
+        '''
+            Return the K neighbors context for a node, it also return
+            information about the current node degree and the neighbors degree
+        ''' 
+        neighbors, times, edge_idxs, mask, n_valid = self.sampler.sample_k(
             node_id=node,
             current_time=ts,
-            is_forward=True
+            is_forward=True,
+            return_edge_idxs=True,
         )
 
         if n_valid == 0:
@@ -208,19 +230,79 @@ class ContextBase(Dataset):
 
         return {
             "deg_current": deg_current,
-            "neighbors": neighbors,
-            "deg_neighbors": deg_neighbors,
-            "delta_t": delta_t,
-            "mask": mask,
-            "times": times,
+            "neighbors": neighbors, ## content 
+            "neighbors_deg": deg_neighbors,
+            "neighbors_delta_t": delta_t,
+            "neighbors_mask": mask,
+            "neighbors_times": times,
+            "neighbors_edge_idxs": edge_idxs,
         }
+
+    def _make_zero_edge_feature(self, size):
+        feature_dim = getattr(self, "edge_feature_dim", 0)
+        return np.zeros((size, feature_dim), dtype=np.float32)
 
     def __len__(self):
         return len(self.examples)
 
     def __getitem__(self, idx):
         return self.examples[idx]
+
+#class TemporalWalkLinkDataset(torch.utils.data.Dataset):
+class TemporalWalkLinkDataset(ContextBase):
     
+    def __init__(self, edge_dataset, graph, sampler, num_nodes):
+        super().__init__(graph, sampler)
+        self.num_nodes = num_nodes
+
+        for sample in edge_dataset:
+            src = int(sample["src"])
+            dst = int(sample["dst"])
+            ts = float(sample["ts"])
+
+            pos = self.build_context(dst, ts)
+            if pos is None:
+                continue
+
+            neg_dst = np.random.randint(0, num_nodes)
+            tries = 0
+
+            while (neg_dst == dst or neg_dst == src) and tries < 20:
+                neg_dst = np.random.randint(0, num_nodes)
+                tries += 1
+
+            # se nao tenho contexto continuo
+            neg = self.build_context(neg_dst, ts)
+            if neg is None:
+                continue
+
+            self.examples.append({
+                "src": src,
+                "dst": dst,
+                "neg_dst": neg_dst,
+
+                "pos_deg_current": pos["deg_current"],
+                "pos_neighbors": pos["neighbors"],
+                "pos_deg_neighbors": pos["deg_neighbors"],
+                "pos_delta_t": pos["delta_t"],
+                "pos_mask": pos["mask"],
+
+                "neg_deg_current": neg["deg_current"],
+                "neg_neighbors": neg["neighbors"],
+                "neg_deg_neighbors": neg["deg_neighbors"],
+                "neg_delta_t": neg["delta_t"],
+                "neg_mask": neg["mask"],
+
+                "target_idx": 0,   # earliest future neighbor
+            })
+
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        return self.examples[idx]
+
 class TemporalWalkSupervisionDataset(ContextBase):
     """
     supervision_mode:
@@ -235,13 +317,28 @@ class TemporalWalkSupervisionDataset(ContextBase):
         graph,
         sampler,
         num_nodes,
-        supervision_mode="earliest",
-        beta=0.1
+        node_features,
+        edge_features,
+        pad_node=None,
+        supervision_mode="soft",
+        beta=0.1,
+
     ):
         super().__init__(graph, sampler)
         self.supervision_mode = supervision_mode
         self.beta = beta
         self.num_nodes = num_nodes
+        self.node_features = np.asarray(node_features)
+        self.edge_features = np.asarray(edge_features)
+        self.pad_node = pad_node
+
+        self.node_feature_dim = 0
+        if self.node_features is not None:
+            self.node_feature_dim = self.node_features.shape[1]
+
+        self.edge_feature_dim = 0
+        if self.edge_features is not None:
+            self.edge_feature_dim = self.edge_features.shape[1]
 
         assert supervision_mode in {
             "earliest",
@@ -253,30 +350,90 @@ class TemporalWalkSupervisionDataset(ContextBase):
             src = int(sample["src"])
             dst = int(sample["dst"])
             ts = float(sample["ts"])
+            edge_idx = int(sample.get("idx", -1))
 
+            # we get the K neighbors context for the node dst : 
+            # -------------------------------------------------
+            # Nomenclature: 
+            #   src -> dst -> x_i |
+            #   prev -> current -> neighbors
+            #   u -> v -> x_i
+            # Positive context is: x_i
+            # -------------------------------------------------
             pos_context = self.build_context(node=dst, ts=ts)
-            if pos_context is None:
+            if pos_context is None: 
                 continue
 
+            # -------------------------------------------------
+            # Negative queried edge: u -> v_neg
+            # -------------------------------------------------
             neg_dst = self.sample_negative_node(src=src, dst=dst, ts=ts)
             neg_context = self.build_context(node=neg_dst, ts=ts)
             if neg_context is None:
                 continue
 
+            # [f_u | f_v | f_x | e_uv | e_vx]
+            # [f_prev | f_curr | f_neighbors | e_current | e_neighbors]
+            previous_node_feat = self._get_node_features(src)
+            current_node_feat = self._get_node_features(dst)
+            neighbors_node_feat = self._safe_node_features(pos_context["neighbors"])
+            # e_uv
+            previous_edge_feat = self._safe_edge_features(edge_idx)
+            # e_vx_i it is array of arrays
+            neighbors_edge_feat = self._safe_edge_features(pos_context["neighbor_edge_idxs"])
+
+            previous_time = np.array([ts], dtype=np.float32) 
+            neighbors_times = pos_context["neighbors_times"].astype(np.float32)
+
+            # neg_previous_node_feat = self._safe_node_features(src)
+            # neg_current_node_feat = self._safe_node_features(neg_dst)
+            # neg_neighbor_node_feat = self._safe_node_features(neg_context["neighbors"])
+            # neg_previous_edge_feat = self._make_zero_edge_feature(1)
+            # neg_neighbor_edge_feat = self._safe_edge_features(neg_context["neighbor_edge_idxs"])
+            # neg_previous_edge_delta = np.zeros((1,), dtype=np.float32)
+            # neg_neighbor_edge_delta = neg_context["delta_t"].astype(np.float32)
+
             example = {
                 "src": src,
                 "dst": dst,
                 "neg_dst": neg_dst,
-                "pos_neighbors": pos_context["neighbors"],
-                "pos_deg_current": pos_context["deg_current"],
-                "pos_deg_neighbors": pos_context["deg_neighbors"],
-                "pos_delta_t": pos_context["delta_t"],
-                "pos_mask": pos_context["mask"],
+
+                # positive nodes neighbors of dst
+                #"pos_neighbors": pos_context["neighbors"],
+                #"pos_deg_current": pos_context["deg_current"],
+                #"pos_deg_neighbors": pos_context["neighbors_deg"],
+                #"pos_delta_t": pos_context["neighbors_delta_t"],
+                #"pos_mask": pos_context["neighbors_mask"],
+
+                # node and edge features 
+                "previous_node_feat": previous_node_feat.astype(np.float32),
+                "current_node_feat": current_node_feat.astype(np.float32),
+                "neighbor_node_feat": neighbors_node_feat.astype(np.float32),
+                # u-v
+                "previous_edge_feat": previous_edge_feat.astype(np.float32),
+                # v-x_i
+                "neighbors_edge_feat": neighbors_edge_feat.astype(np.float32),
+                # times
+                "previous_time": previous_time,
+                "neighbors_times": neighbors_times,
+                "neighbors_delta_t": pos_context["neighbors_delta_t"],
+
+                # negative similar nodes
                 "neg_neighbors": neg_context["neighbors"],
                 "neg_deg_current": neg_context["deg_current"],
-                "neg_deg_neighbors": neg_context["deg_neighbors"],
-                "neg_delta_t": neg_context["delta_t"],
-                "neg_mask": neg_context["mask"],
+                "neg_deg_neighbors": neg_context["neighbors_deg"],
+                "neg_delta_t": neg_context["neighbors_delta_t"],
+                "neg_mask": neg_context["neighbors_mask"],
+
+
+
+                # "neg_previous_node_feat": neg_previous_node_feat.astype(np.float32),
+                # "neg_current_node_feat": neg_current_node_feat.astype(np.float32),
+                # "neg_neighbor_node_feat": neg_neighbor_node_feat.astype(np.float32),
+                # "neg_previous_edge_feat": neg_previous_edge_feat.astype(np.float32),
+                # "neg_neighbor_edge_feat": neg_neighbor_edge_feat.astype(np.float32),
+                # "neg_previous_edge_delta": neg_previous_edge_delta,
+                # "neg_neighbor_edge_delta": neg_neighbor_edge_delta,
             }
 
             # ---------------------------------------
@@ -297,10 +454,10 @@ class TemporalWalkSupervisionDataset(ContextBase):
             # ---------------------------------------
             elif supervision_mode == "sampled":
                 probs = temporal_target_distribution(
-                    times=pos_context["times"], 
-                    mask=pos_context["mask"], 
-                    current_time=ts, 
-                    beta=beta
+                    times=pos_context["times"],
+                    mask=pos_context["mask"],
+                    current_time=ts,
+                    beta=beta,
                 )
 
                 if probs is None:
@@ -322,10 +479,10 @@ class TemporalWalkSupervisionDataset(ContextBase):
             # ---------------------------------------
             elif supervision_mode == "soft":
                 probs = temporal_target_distribution(
-                    times=pos_context["times"], 
-                    mask=pos_context["mask"], 
-                    current_time=ts, 
-                    beta=beta
+                    times=pos_context["times"],
+                    mask=pos_context["mask"],
+                    current_time=ts,
+                    beta=beta,
                 )
 
                 if probs is None:
@@ -393,7 +550,32 @@ class TemporalWalkSupervisionDataset(ContextBase):
                 example["target_idx"] = target
 
         return example
+    
+    def _get_node_features(self, node):
+        if self.node_features is None:
+            return np.zeros((1, self.node_feature_dim), dtype=np.float32)
 
+        node_ids = np.atleast_1d(np.asarray(node, dtype=np.int64))
+        out = np.zeros((len(node_ids), self.node_feature_dim), dtype=np.float32)
+
+        for i, node_id in enumerate(node_ids):
+            if 0 <= node_id < len(self.node_features):
+                out[i] = self.node_features[node_id]
+        return out
+
+    def _get_edge_features(self, edge_idx):
+        if self.edge_features is None:
+            return np.zeros((1, self.edge_feature_dim), dtype=np.float32)
+
+        edge_ids = np.atleast_1d(np.asarray(edge_idx, dtype=np.int64))
+        out = np.zeros((len(edge_ids), self.edge_feature_dim), dtype=np.float32)
+
+        for i, edge_id in enumerate(edge_ids):
+            if 0 <= edge_id < len(self.edge_features):
+                out[i] = self.edge_features[edge_id]
+
+        return out
+    
 class TemporalWalkSupervisionDataDriven(ContextBase):
     def __init__(
         self,
@@ -607,61 +789,6 @@ class TemporalWalkContinuationDataset(torch.utils.data.Dataset):
                 "target_idx": target_idx,
                 "target_node": int(x_true),
             })
-
-    def __len__(self):
-        return len(self.examples)
-
-    def __getitem__(self, idx):
-        return self.examples[idx]
-
-#class TemporalWalkLinkDataset(torch.utils.data.Dataset):
-class TemporalWalkLinkDataset(ContextBase):
-    
-    def __init__(self, edge_dataset, graph, sampler, num_nodes):
-        super().__init__(graph, sampler)
-        self.num_nodes = num_nodes
-
-        for sample in edge_dataset:
-            src = int(sample["src"])
-            dst = int(sample["dst"])
-            ts = float(sample["ts"])
-
-            pos = self.build_context(dst, ts)
-            if pos is None:
-                continue
-
-            neg_dst = np.random.randint(0, num_nodes)
-            tries = 0
-
-            while (neg_dst == dst or neg_dst == src) and tries < 20:
-                neg_dst = np.random.randint(0, num_nodes)
-                tries += 1
-
-            # se nao tenho contexto continuo
-            neg = self.build_context(neg_dst, ts)
-            if neg is None:
-                continue
-
-            self.examples.append({
-                "src": src,
-                "dst": dst,
-                "neg_dst": neg_dst,
-
-                "pos_deg_current": pos["deg_current"],
-                "pos_neighbors": pos["neighbors"],
-                "pos_deg_neighbors": pos["deg_neighbors"],
-                "pos_delta_t": pos["delta_t"],
-                "pos_mask": pos["mask"],
-
-                "neg_deg_current": neg["deg_current"],
-                "neg_neighbors": neg["neighbors"],
-                "neg_deg_neighbors": neg["deg_neighbors"],
-                "neg_delta_t": neg["delta_t"],
-                "neg_mask": neg["mask"],
-
-                "target_idx": 0,   # earliest future neighbor
-            })
-
 
     def __len__(self):
         return len(self.examples)
@@ -975,39 +1102,60 @@ class Data:
     self.n_unique_nodes = len(self.unique_nodes)
     
 
-def get_data_node_classification(path_file, dataset_name, use_validation=False):
-  ### Load data and train val test split
-  graph_df = pd.read_csv('{}/ml_{}.csv'.format(path_file, dataset_name))
-  edge_features = np.load('{}/ml_{}.npy'.format(path_file, dataset_name))
-  node_features = np.load('{}/ml_{}_node.npy'.format(path_file, dataset_name)) 
+def load_data(path_file, dataset_name):
+    ### Load data and train val test split
+    graph_df = pd.read_csv('{}/ml_{}.csv'.format(path_file, dataset_name))
+    edge_features = np.load('{}/ml_{}.npy'.format(path_file, dataset_name))
+    node_features = np.load('{}/ml_{}_node.npy'.format(path_file, dataset_name)) 
 
-  val_time, test_time = list(np.quantile(graph_df.ts, [0.70, 0.85]))
+    val_time, test_time = list(np.quantile(graph_df.ts, [0.70, 0.85]))
 
-  sources = graph_df.u.values
-  destinations = graph_df.i.values
-  edge_idxs = graph_df.idx.values
-  labels = graph_df.label.values
-  timestamps = graph_df.ts.values
+    sources = graph_df.u.values
+    destinations = graph_df.i.values
+    edge_idxs = graph_df.idx.values
+    labels = graph_df.label.values
+    timestamps = graph_df.ts.values
 
-  random.seed(2020)
+    random.seed(2020)
 
-  train_mask = timestamps <= val_time if use_validation else timestamps <= test_time
-  test_mask = timestamps > test_time
-  val_mask = np.logical_and(timestamps <= test_time, timestamps > val_time) if use_validation else test_mask
+    #train_mask = timestamps <= test_time
+    #test_mask = timestamps > test_time
+    #val_mask = np.logical_and(timestamps <= test_time, timestamps > val_time)
 
-  full_data = Data(sources, destinations, timestamps, edge_idxs, labels)
+    # much better configuration for training, validation, and testing splits 
+    # means training has access to events occurring between 70% and 85% of the timeline.
+    # the previous configurarion has already seen much more recent interactions than intended
+    train_mask = timestamps <= val_time
+    val_mask = (timestamps > val_time) & (timestamps <= test_time)
+    test_mask = timestamps > test_time
 
-  train_data = Data(sources[train_mask], destinations[train_mask], timestamps[train_mask],
-                    edge_idxs[train_mask], labels[train_mask])
+    train_edge = EdgeDataset(
+        sources[train_mask],
+        destinations[train_mask],
+        timestamps[train_mask],
+        edge_idxs[train_mask],
+        labels[train_mask],
+    )
 
-  val_data = Data(sources[val_mask], destinations[val_mask], timestamps[val_mask],
-                  edge_idxs[val_mask], labels[val_mask])
+    test_edge = EdgeDataset(
+        sources[test_mask],
+        destinations[test_mask],
+        timestamps[test_mask],
+        edge_idxs[test_mask],
+        labels[test_mask],
+    )
 
-  test_data = Data(sources[test_mask], destinations[test_mask], timestamps[test_mask],
-                   edge_idxs[test_mask], labels[test_mask])
+    val_edge = EdgeDataset(
+        sources[val_mask], 
+        destinations[val_mask],
+        timestamps[val_mask],
+        edge_idxs[val_mask],
+        labels[val_mask]
+    )
 
-  return full_data, node_features, edge_features, train_data, val_data, test_data
+    full_edge = EdgeDataset(sources, destinations, timestamps, edge_idxs, labels)
 
+    return full_edge, node_features, edge_features, train_edge, val_edge, test_edge
 
 def get_data(path_file, dataset_name, different_new_nodes_between_val_and_test=False, randomize_features=False):
   ### Load data and train val test split
