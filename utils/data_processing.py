@@ -19,17 +19,6 @@ Data Parameters:
 '''
 
 
-def temporal_target_distribution(times, mask, current_time, beta=0.1):
-    delta = times - current_time
-    delta[~mask] = 0
-
-    weights = np.exp(-beta * delta)
-    weights[~mask] = 0
-
-    probs = weights / (weights.sum() + 1e-12)
-
-    return probs.astype(np.float32)
-
 '''
 the strongest version is to sample one observed continuation according to a temporal distribution.
 prefer temporally plausible continuations 
@@ -46,7 +35,7 @@ def sample_temporal_target(valid_neighbors, valid_times, current_time, lamb=0.1)
     return valid_neighbors[idx]
 
 
-def temporal_target_distribution(times, mask, current_time, beta=0.1):
+def temporal_target_distribution(times, mask, current_time, beta=0.001):
     delta = times - current_time
     delta = np.maximum(delta, 0)
 
@@ -102,6 +91,7 @@ class ObservedTrajectoryIndex:
         max_horizon=None,
         max_continuations=None,
     ):
+        
         self.counts = defaultdict(lambda: defaultdict(int))
 
         # A stable NumPy sort avoids materializing and sorting one Python tuple
@@ -170,7 +160,18 @@ class ObservedTrajectoryIndex:
     ):
         """
         Returns q_obs over the padded candidate set.
+
+        When the observed continuation table has no support for this context,
+        fall back to a uniform distribution over the valid candidates instead of
+        returning an all-zero target. Otherwise the KL objective becomes
+        degenerate and the walk head receives almost no signal.
         """
+
+        candidate_nodes = np.asarray(candidate_nodes)
+        mask = np.asarray(mask, dtype=bool)
+
+        if candidate_nodes.size == 0 or not mask.any():
+            return None
 
         probs = np.zeros(
             len(candidate_nodes),
@@ -193,12 +194,12 @@ class ObservedTrajectoryIndex:
         if smoothing > 0:
             probs[mask] += smoothing
 
-        total = probs.sum()
+        valid_total = probs[mask].sum()
+        if valid_total <= 0:
+            probs[mask] = 1.0
+            valid_total = probs[mask].sum()
 
-        if total <= 0:
-            return None
-
-        return probs / total
+        return probs / valid_total
 
 class ContextBase(Dataset):
     def __init__(self, graph, sampler):
@@ -206,7 +207,7 @@ class ContextBase(Dataset):
         self.graph = graph
         self.sampler = sampler
 
-    def build_context(self, node, ts):
+    def build_context(self, node, ts, is_forward=False):
         '''
             Return the K neighbors context for a node, it also return
             information about the current node degree and the neighbors degree
@@ -214,17 +215,24 @@ class ContextBase(Dataset):
         neighbors, times, edge_idxs, mask, n_valid = self.sampler.sample_k(
             node_id=node,
             current_time=ts,
-            is_forward=True,
+            is_forward=is_forward,
             return_edge_idxs=True,
         )
+
+        if is_forward:
+            # Future continuation: t_vx - t
+            delta_t = times - ts
+        else:
+            # Historical interaction: t - t_vx
+            delta_t = ts - times
 
         if n_valid == 0:
             return None
 
+
         deg_current = self.graph.get_degree(node)
         deg_neighbors = self.graph.get_degree_neighbors(neighbors)
 
-        delta_t = times - ts
         delta_t[~mask] = 0
         delta_t = np.maximum(delta_t, 0)
 
@@ -232,11 +240,26 @@ class ContextBase(Dataset):
             "deg_current": deg_current,
             "neighbors": neighbors, ## content 
             "neighbors_deg": deg_neighbors,
-            "neighbors_delta_t": delta_t,
-            "neighbors_mask": mask,
             "neighbors_times": times,
+            "neighbors_delta_t": delta_t,
+            "neighbors_masks": mask,
             "neighbors_edge_idxs": edge_idxs,
         }
+        
+    def get_last_iteraction(self, src, dst, t):
+            
+        last_time = self.graph.get_last_interaction(
+            src=src,
+            dst=dst,
+            before_time=t,
+        )
+
+        if last_time is None:
+            previous_edge_delta_t = 0.0
+        else:
+            previous_edge_delta_t = t - last_time
+
+        return previous_edge_delta_t
 
     def _make_zero_edge_feature(self, size):
         feature_dim = getattr(self, "edge_feature_dim", 0)
@@ -283,15 +306,15 @@ class TemporalWalkLinkDataset(ContextBase):
 
                 "pos_deg_current": pos["deg_current"],
                 "pos_neighbors": pos["neighbors"],
-                "pos_deg_neighbors": pos["deg_neighbors"],
-                "pos_delta_t": pos["delta_t"],
-                "pos_mask": pos["mask"],
+                "pos_deg_neighbors": pos["neighbors_deg"],
+                "pos_delta_t": pos["neighbors_delta_t"],
+                "pos_mask": pos["neighbors_masks"],
 
                 "neg_deg_current": neg["deg_current"],
                 "neg_neighbors": neg["neighbors"],
-                "neg_deg_neighbors": neg["deg_neighbors"],
-                "neg_delta_t": neg["delta_t"],
-                "neg_mask": neg["mask"],
+                "neg_deg_neighbors": neg["neighbors_deg"],
+                "neg_delta_t": neg["neighbors_delta_t"],
+                "neg_mask": neg["neighbors_masks"],
 
                 "target_idx": 0,   # earliest future neighbor
             })
@@ -317,11 +340,218 @@ class TemporalWalkSupervisionDataset(ContextBase):
         graph,
         sampler,
         num_nodes,
+        supervision_mode="earliest",
+        beta=0.1,
+        is_fordward=True
+    ):
+        super().__init__(graph, sampler)
+        self.supervision_mode = supervision_mode
+        self.beta = beta
+        self.num_nodes = num_nodes
+
+        assert supervision_mode in {
+            "earliest",
+            "sampled",
+            "soft",
+        }
+
+        for sample in edge_dataset:
+            src = int(sample["src"])
+            dst = int(sample["dst"])
+            ts = float(sample["ts"])
+
+            # is_fordward = True for positive future neighbors
+            pos_context = self.build_context(node=dst, ts=ts, is_forward=is_fordward)
+            if pos_context is None:
+                continue
+
+            neg_dst = self.sample_negative_node(src=src, dst=dst, ts=ts)
+            if neg_dst is None:
+                continue
+
+            neg_context = self.build_context(node=neg_dst, ts=ts)
+            if neg_context is None:
+                continue
+
+            example = {
+                "src": src,
+                "dst": dst,
+                "neg_dst": neg_dst,
+                "pos_neighbors": pos_context["neighbors"],
+                "pos_deg_current": pos_context["deg_current"],
+                "pos_deg_neighbors": pos_context["neighbors_deg"],
+                "pos_delta_t": pos_context["neighbors_delta_t"],
+                "pos_mask": pos_context["neighbors_masks"],
+                "neg_neighbors": neg_context["neighbors"],
+                "neg_deg_current": neg_context["deg_current"],
+                "neg_deg_neighbors": neg_context["neighbors_deg"],
+                "neg_delta_t": neg_context["neighbors_delta_t"],
+                "neg_mask": neg_context["neighbors_masks"],
+            }
+
+            # ---------------------------------------
+            # Experiment 1: earliest future neighbor
+            # ---------------------------------------
+            if supervision_mode == "earliest":
+                target_idx = _valid_target_index(
+                    pos_context["neighbors_masks"],
+                    supervision_mode="earliest",
+                )
+                if target_idx is None:
+                    continue
+                example["target_idx"] = target_idx
+
+            # ---------------------------------------
+            # Experiment 2: sampled temporal target
+            # q(x) proportional to exp(-beta * delta_t)
+            # ---------------------------------------
+            elif supervision_mode == "sampled":
+                probs = temporal_target_distribution(
+                    times=pos_context["neighbors_times"], 
+                    mask=pos_context["neighbors_masks"], 
+                    current_time=ts, 
+                    beta=beta
+                )
+
+                if probs is None:
+                    continue
+
+                target_idx = _valid_target_index(
+                    pos_context["neighbors_masks"],
+                    probs=probs,
+                    supervision_mode="sampled",
+                )
+                if target_idx is None:
+                    continue
+                example["target_probs"] = probs.astype(np.float32)
+                example["target_idx"] = int(target_idx)
+
+            # ---------------------------------------
+            # Experiment 3: soft-label supervision
+            # target_probs = q(x)
+            # ---------------------------------------
+            elif supervision_mode == "soft":
+                # the target distribution is :q_i = exp(-\beta\delta t)
+                # exp(-\beta*median_future_delta) receives the half the weight of immediate neighbor
+                # This has three advantages:
+
+                # Scale adaptation: beta changes with each dataset’s timestamp units.
+                # Interpretability: the median future gap is the decay half-life.
+                # Robustness: the median is less affected by very large temporal gaps than the mean
+                
+                if beta==-1:
+                    valid_deltas = pos_context["neighbors_delta_t"][
+                        pos_context["neighbors_masks"]
+                    ]
+                    valid_deltas = valid_deltas[valid_deltas > 0]
+                    if valid_deltas.size == 0:
+                        continue
+                    median_delta = np.median(valid_deltas)
+                    beta = np.log(2.0) / median_delta
+
+                    
+                probs = temporal_target_distribution(
+                    times=pos_context["neighbors_times"], 
+                    mask=pos_context["neighbors_masks"], 
+                    current_time=ts, 
+                    beta=beta
+                )
+
+                if probs is None:
+                    continue
+
+                example["target_probs"] = probs.astype(np.float32)
+
+            self.examples.append(example)
+
+    def sample_negative_node(self, src, dst, ts=None, pool_size=16):
+        """
+            the negative node is likely to be:
+                - A neighbor of the true destination dst;
+                - Not equal to src or dst, but degree-similar to dst.
+
+            Conceptually, it creates a degree-aware hard negative.
+        """
+        if self.num_nodes <= 0:
+            return int(dst)
+        seen = {src, dst}
+
+        # get neighbors of dst
+        if ts is None:
+            candidate_nodes = set(self.graph.get_neighbors(dst, undirected=True, unique=True))
+        else:    
+            candidate_nodes = set(self.graph.get_neighbors(
+                dst,
+                timestamp=ts,
+                is_fordward=False,
+                undirected=True,
+                unique=True,
+            ))
+
+        # instead of random negatives, it samples nodes structurally close to dst.
+        # candidate_nodes = [node for node in candidate_nodes if node not in seen]
+        # we check if the edge exists before the current timestamp,
+        # and if it does, we exclude it from the candidate pool.
+        candidate_nodes = [node 
+                           for node in candidate_nodes 
+                           if node not in seen and not self.graph.edge_exists_before(src, node, ts)]
+        
+        #It limits the candidate pool to at most 16 nodes.
+        if len(candidate_nodes) > pool_size:
+            candidate_nodes = list(np.random.choice(candidate_nodes, size=pool_size, replace=False))
+        if not candidate_nodes:
+            return None
+
+        # Nodes with degree similar to dst receive higher probability.
+        dst_degree = self.graph.get_degree(dst)
+        weights = np.ones(len(candidate_nodes), dtype=np.float32)
+        for idx, node in enumerate(candidate_nodes):
+            degree_gap = abs(self.graph.get_degree(node) - dst_degree)
+            weights[idx] = 1.0 + 1.0 / (1.0 + degree_gap)
+        weights = np.maximum(weights, 1e-6)
+        probs = weights / weights.sum()
+        return int(np.random.choice(candidate_nodes, p=probs))
+
+    
+    def __getitem__(self, idx):
+        '''
+        In every epoch get different sample  
+        '''    
+        example = self.examples[idx]
+
+        if self.supervision_mode == "sampled":
+            probs = example["target_probs"]
+            mask = example["pos_mask"]
+            target = _valid_target_index(
+                mask,
+                probs=probs,
+                supervision_mode="sampled",
+            )
+            if target is not None:
+                example["target_idx"] = target
+
+        return example
+    
+class TemporalWalkSupervisionDatasetFeat(ContextBase):
+    """
+    supervision_mode:
+        "earliest" -> Experiment 1
+        "sampled"  -> Experiment 2
+        "soft"     -> Experiment 3
+    """
+
+    def __init__(
+        self,
+        edge_dataset,
+        graph,
+        sampler,
+        num_nodes,
         node_features,
         edge_features,
         pad_node=None,
         supervision_mode="soft",
         beta=0.1,
+        is_fordward=True
 
     ):
         super().__init__(graph, sampler)
@@ -352,6 +582,7 @@ class TemporalWalkSupervisionDataset(ContextBase):
             ts = float(sample["ts"])
             edge_idx = int(sample.get("idx", -1))
 
+            # Historical context: positive link prediction
             # we get the K neighbors context for the node dst : 
             # -------------------------------------------------
             # Nomenclature: 
@@ -360,7 +591,7 @@ class TemporalWalkSupervisionDataset(ContextBase):
             #   u -> v -> x_i
             # Positive context is: x_i
             # -------------------------------------------------
-            pos_context = self.build_context(node=dst, ts=ts)
+            pos_context = self.build_context(node=dst, ts=ts, is_forward=is_fordward)
             if pos_context is None: 
                 continue
 
@@ -368,22 +599,32 @@ class TemporalWalkSupervisionDataset(ContextBase):
             # Negative queried edge: u -> v_neg
             # -------------------------------------------------
             neg_dst = self.sample_negative_node(src=src, dst=dst, ts=ts)
-            neg_context = self.build_context(node=neg_dst, ts=ts)
-            if neg_context is None:
+            if neg_dst is None:
                 continue
 
+            # Historical context is available for the negative candidate at ts.
+            neg_context = self.build_context(node=neg_dst, ts=ts, is_forward=False)
+            if neg_context is None:
+                continue
+   
             # [f_u | f_v | f_x | e_uv | e_vx]
             # [f_prev | f_curr | f_neighbors | e_current | e_neighbors]
             previous_node_feat = self._get_node_features(src)
             current_node_feat = self._get_node_features(dst)
-            neighbors_node_feat = self._safe_node_features(pos_context["neighbors"])
+            neighbors_node_feat = self._get_node_features(pos_context["neighbors"])
             # e_uv
-            previous_edge_feat = self._safe_edge_features(edge_idx)
+            previous_edge_feat = self._get_edge_features(edge_idx)
+            
             # e_vx_i it is array of arrays
-            neighbors_edge_feat = self._safe_edge_features(pos_context["neighbor_edge_idxs"])
-
-            previous_time = np.array([ts], dtype=np.float32) 
+            neighbors_edge_feat = self._get_edge_features(pos_context["neighbors_edge_idxs"])
+            #previous_time = np.array([ts], dtype=np.float32) 
+            previous_edge_delta_t = self.get_last_iteraction(src, dst, ts)
             neighbors_times = pos_context["neighbors_times"].astype(np.float32)
+
+            neg_current_node_feat = self._get_node_features(neg_dst)
+            neg_neighbor_node_feat = self._get_node_features(neg_context["neighbors"])
+            #neg_previous_edge_feat = self._make_zero_edge_feature(1)[0]
+            neg_neighbors_edge_feat = self._get_edge_features(neg_context["neighbors_edge_idxs"])
 
             # neg_previous_node_feat = self._safe_node_features(src)
             # neg_current_node_feat = self._safe_node_features(neg_dst)
@@ -399,41 +640,35 @@ class TemporalWalkSupervisionDataset(ContextBase):
                 "neg_dst": neg_dst,
 
                 # positive nodes neighbors of dst
-                #"pos_neighbors": pos_context["neighbors"],
-                #"pos_deg_current": pos_context["deg_current"],
-                #"pos_deg_neighbors": pos_context["neighbors_deg"],
-                #"pos_delta_t": pos_context["neighbors_delta_t"],
-                #"pos_mask": pos_context["neighbors_mask"],
-
-                # node and edge features 
-                "previous_node_feat": previous_node_feat.astype(np.float32),
-                "current_node_feat": current_node_feat.astype(np.float32),
-                "neighbor_node_feat": neighbors_node_feat.astype(np.float32),
-                # u-v
-                "previous_edge_feat": previous_edge_feat.astype(np.float32),
-                # v-x_i
-                "neighbors_edge_feat": neighbors_edge_feat.astype(np.float32),
-                # times
-                "previous_time": previous_time,
-                "neighbors_times": neighbors_times,
-                "neighbors_delta_t": pos_context["neighbors_delta_t"],
+                "pos_neighbors": pos_context["neighbors"],
+                "pos_deg_current": pos_context["deg_current"],
+                "pos_deg_neighbors": pos_context["neighbors_deg"],
+                "pos_delta_t": pos_context["neighbors_delta_t"],
+                "pos_mask": pos_context["neighbors_masks"],
 
                 # negative similar nodes
                 "neg_neighbors": neg_context["neighbors"],
                 "neg_deg_current": neg_context["deg_current"],
                 "neg_deg_neighbors": neg_context["neighbors_deg"],
                 "neg_delta_t": neg_context["neighbors_delta_t"],
-                "neg_mask": neg_context["neighbors_mask"],
+                "neg_mask": neg_context["neighbors_masks"],
 
+                # node and edge features 
+                "previous_node_feat": previous_node_feat.astype(np.float32),
+                "current_node_feat": current_node_feat.astype(np.float32),
+                "neighbor_node_feat": neighbors_node_feat.astype(np.float32),
+                "previous_edge_feat": previous_edge_feat.astype(np.float32),  # u-v
+                "neighbors_edge_feat": neighbors_edge_feat.astype(np.float32), # v-x_i
+                # times
+                "previous_time": previous_edge_delta_t,
+                "neighbors_times": neighbors_times,
+                "neighbors_delta_t": pos_context["neighbors_delta_t"],
 
-
-                # "neg_previous_node_feat": neg_previous_node_feat.astype(np.float32),
-                # "neg_current_node_feat": neg_current_node_feat.astype(np.float32),
-                # "neg_neighbor_node_feat": neg_neighbor_node_feat.astype(np.float32),
-                # "neg_previous_edge_feat": neg_previous_edge_feat.astype(np.float32),
-                # "neg_neighbor_edge_feat": neg_neighbor_edge_feat.astype(np.float32),
-                # "neg_previous_edge_delta": neg_previous_edge_delta,
-                # "neg_neighbor_edge_delta": neg_neighbor_edge_delta,
+                "neg_current_node_feat": neg_current_node_feat.astype(np.float32),
+                "neg_neighbor_node_feat": neg_neighbor_node_feat.astype(np.float32),
+                #"neg_previous_edge_feat": neg_previous_edge_feat.astype(np.float32),
+                "neg_neighbors_edge_feat": neg_neighbors_edge_feat.astype(np.float32),
+                "neg_neighbors_delta_t": neg_context["neighbors_delta_t"].astype(np.float32)
             }
 
             # ---------------------------------------
@@ -441,7 +676,7 @@ class TemporalWalkSupervisionDataset(ContextBase):
             # ---------------------------------------
             if supervision_mode == "earliest":
                 target_idx = _valid_target_index(
-                    pos_context["mask"],
+                    pos_context["neighbors_masks"],
                     supervision_mode="earliest",
                 )
                 if target_idx is None:
@@ -454,8 +689,8 @@ class TemporalWalkSupervisionDataset(ContextBase):
             # ---------------------------------------
             elif supervision_mode == "sampled":
                 probs = temporal_target_distribution(
-                    times=pos_context["times"],
-                    mask=pos_context["mask"],
+                    times=pos_context["neighbors_times"],
+                    mask=pos_context["neighbors_masks"],
                     current_time=ts,
                     beta=beta,
                 )
@@ -464,7 +699,7 @@ class TemporalWalkSupervisionDataset(ContextBase):
                     continue
 
                 target_idx = _valid_target_index(
-                    pos_context["mask"],
+                    pos_context["neighbors_masks"],
                     probs=probs,
                     supervision_mode="sampled",
                 )
@@ -479,8 +714,8 @@ class TemporalWalkSupervisionDataset(ContextBase):
             # ---------------------------------------
             elif supervision_mode == "soft":
                 probs = temporal_target_distribution(
-                    times=pos_context["times"],
-                    mask=pos_context["mask"],
+                    times=pos_context["neighbors_times"],
+                    mask=pos_context["neighbors_masks"],
                     current_time=ts,
                     beta=beta,
                 )
@@ -508,18 +743,32 @@ class TemporalWalkSupervisionDataset(ContextBase):
         if ts is None:
             candidate_nodes = set(self.graph.get_neighbors(dst, undirected=True, unique=True))
         else:
-            candidate_nodes = set(self.graph.get_neighbors(dst, timestamp=ts, undirected=True, unique=True))
+            # sampling from neighbors of dst
+            candidate_nodes = set(
+                self.graph.get_neighbors(
+                    dst,
+                    timestamp=ts,
+                    is_fordward=False,
+                    undirected=True,
+                    unique=True,
+                )
+            )
 
         # instead of random negatives, it samples nodes structurally close to dst.
         # candidate_nodes = [node for node in candidate_nodes if node not in seen]
         # we check if the edge exists before the current timestamp, and if it does, we exclude it from the candidate pool.
-        candidate_nodes = [node for node in candidate_nodes if node not in seen and not self.graph.edge_exists_before(src, node, ts)]
+        candidate_nodes = [
+            node for node in candidate_nodes 
+            if node not in seen and 
+                    not self.graph.edge_exists_before(src, node, ts)
+        ]
         
         #It limits the candidate pool to at most 16 nodes.
         if len(candidate_nodes) > pool_size:
             candidate_nodes = list(np.random.choice(candidate_nodes, size=pool_size, replace=False))
         if not candidate_nodes:
-            return int(dst)
+            #return int(dst)
+            return None
 
         # Nodes with degree similar to dst receive higher probability.
         dst_degree = self.graph.get_degree(dst)
@@ -605,6 +854,19 @@ class TemporalWalkSupervisionDataDriven(ContextBase):
             dst = int(sample["dst"])
             ts = float(sample["ts"])
 
+
+            '''
+                return {
+                    "deg_current": deg_current,
+                    "neighbors": neighbors, ## content 
+                    "neighbors_deg": deg_neighbors,
+                    "neighbors_times": times,
+                    "neighbors_delta_t": delta_t,
+                    "neighbors_masks": mask,
+                    "neighbors_edge_idxs": edge_idxs,
+                }
+            '''
+
             pos_context = self.build_context(
                 node=dst,
                 ts=ts,
@@ -617,13 +879,19 @@ class TemporalWalkSupervisionDataDriven(ContextBase):
                 previous_node=src,
                 current_node=dst,
                 candidate_nodes=pos_context["neighbors"],
-                mask=pos_context["mask"],
+                mask=pos_context["neighbors_masks"],
                 smoothing=smoothing,
             )
 
-            # No observed continuation for this context.
+            # If there is no empirical support, fall back to a uniform
+            # distribution over the valid candidates so the walk loss remains
+            # meaningful instead of collapsing to zero mass.
             if target_probs is None:
-                continue
+                valid_positions = np.flatnonzero(pos_context["neighbors_masks"])
+                if len(valid_positions) == 0:
+                    continue
+                target_probs = np.zeros_like(pos_context["neighbors"], dtype=np.float32)
+                target_probs[valid_positions] = 1.0 / len(valid_positions)
 
             neg_dst = self.sample_negative_node(
                 src=src,
@@ -639,6 +907,17 @@ class TemporalWalkSupervisionDataDriven(ContextBase):
             if neg_context is None:
                 continue
 
+            '''
+                return {
+                    "deg_current": deg_current,
+                    "neighbors": neighbors, ## content 
+                    "neighbors_deg": deg_neighbors,
+                    "neighbors_times": times,
+                    "neighbors_delta_t": delta_t,
+                    "neighbors_masks": mask,
+                    "neighbors_edge_idxs": edge_idxs,
+                }
+            '''
             example = {
                 "src": src,
                 "dst": dst,
@@ -646,15 +925,15 @@ class TemporalWalkSupervisionDataDriven(ContextBase):
 
                 "pos_neighbors": pos_context["neighbors"],
                 "pos_deg_current": pos_context["deg_current"],
-                "pos_deg_neighbors": pos_context["deg_neighbors"],
-                "pos_delta_t": pos_context["delta_t"],
-                "pos_mask": pos_context["mask"],
+                "pos_deg_neighbors": pos_context["neighbors_deg"],
+                "pos_delta_t": pos_context["neighbors_delta_t"],
+                "pos_mask": pos_context["neighbors_masks"],
 
                 "neg_neighbors": neg_context["neighbors"],
                 "neg_deg_current": neg_context["deg_current"],
-                "neg_deg_neighbors": neg_context["deg_neighbors"],
-                "neg_delta_t": neg_context["delta_t"],
-                "neg_mask": neg_context["mask"],
+                "neg_deg_neighbors": neg_context["neighbors_deg"],
+                "neg_delta_t": neg_context["neighbors_delta_t"],
+                "neg_mask": neg_context["neighbors_masks"],
 
                 "target_probs": target_probs.astype(np.float32),
             }
@@ -1312,7 +1591,6 @@ def collate_temporal_walk(batch):
 
     return output
 
-
 def collate_temporal_walk_link(batch):
     output = {
         "src": torch.tensor([x["src"] for x in batch], dtype=torch.long),
@@ -1331,6 +1609,44 @@ def collate_temporal_walk_link(batch):
         "neg_delta_t": torch.tensor(np.stack([x["neg_delta_t"] for x in batch]), dtype=torch.float),
         "neg_mask": torch.tensor(np.stack([x["neg_mask"] for x in batch]), dtype=torch.bool),
     }
+    if "target_idx" in batch[0]:
+        output["target_idx"] = torch.tensor([x["target_idx"] for x in batch], dtype=torch.long)
+    elif "target_probs" in batch[0]:
+        output["target_probs"] = torch.tensor(np.stack([x["target_probs"] for x in batch]), dtype=torch.float)
+    return output
+
+def collate_temporal_walk_link_feat(batch):
+    output = {
+        "src": torch.tensor([x["src"] for x in batch], dtype=torch.long),
+        "dst": torch.tensor([x["dst"] for x in batch], dtype=torch.long),
+        "neg_dst": torch.tensor([x["neg_dst"] for x in batch], dtype=torch.long),
+
+        "pos_deg_current": torch.tensor([x["pos_deg_current"] for x in batch], dtype=torch.long),
+        "pos_neighbors": torch.tensor(np.stack([x["pos_neighbors"] for x in batch]), dtype=torch.long),
+        "pos_deg_neighbors": torch.tensor(np.stack([x["pos_deg_neighbors"] for x in batch]), dtype=torch.long),
+        "pos_delta_t": torch.tensor(np.stack([x["pos_delta_t"] for x in batch]), dtype=torch.float),
+        "pos_mask": torch.tensor(np.stack([x["pos_mask"] for x in batch]), dtype=torch.bool),
+
+        "neg_deg_current": torch.tensor([x["neg_deg_current"] for x in batch], dtype=torch.long),
+        "neg_neighbors": torch.tensor(np.stack([x["neg_neighbors"] for x in batch]), dtype=torch.long),
+        "neg_deg_neighbors": torch.tensor(np.stack([x["neg_deg_neighbors"] for x in batch]), dtype=torch.long),
+        "neg_delta_t": torch.tensor(np.stack([x["neg_delta_t"] for x in batch]), dtype=torch.float),
+        "neg_mask": torch.tensor(np.stack([x["neg_mask"] for x in batch]), dtype=torch.bool),
+    }
+
+    if "previous_node_feat" in batch[0]:
+        feature_keys = (
+            "previous_node_feat", "current_node_feat", "neighbor_node_feat",
+            "neighbors_edge_feat", "neighbors_times", "neighbors_delta_t",
+            "neg_current_node_feat",
+            "neg_neighbor_node_feat", "neg_neighbors_edge_feat",
+            "neg_neighbors_delta_t",
+        )
+        output.update({
+            key: torch.tensor(np.stack([x[key] for x in batch]), dtype=torch.float)
+            for key in feature_keys
+        })
+
     if "target_idx" in batch[0]:
         output["target_idx"] = torch.tensor([x["target_idx"] for x in batch], dtype=torch.long)
     elif "target_probs" in batch[0]:

@@ -56,6 +56,7 @@ class GraphStorage(object):
         return self.unique_nodes
     
     def num_nodes(self):
+        
         return self.n_unique_nodes
 
     def get_neighbors(
@@ -176,3 +177,26 @@ class GraphStorage(object):
             result = [self._get_degree(node_id=n, timestamp=time) for n in neighbors]
 
         return result
+    
+    def get_last_interaction(self, src, dst, before_time):
+        """
+        Return the latest timestamp of edge (src, dst)
+        strictly before before_time.
+
+        Returns None when no previous interaction exists.
+        """
+
+        last_time = None
+
+        for neighbor, edge_time, _ in self.adj_list.get(src, []):
+            if neighbor != dst:
+                continue
+
+            if edge_time >= before_time:
+                continue
+
+            if last_time is None or edge_time > last_time:
+                last_time = edge_time
+
+        return last_time
+    

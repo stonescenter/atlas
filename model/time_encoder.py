@@ -146,3 +146,113 @@ class HarmonicTimeEncoder(nn.Module):
         )
 
         return harmonic
+
+"""
+Module: GraphMixer Time-encoder
+"""
+
+class GrapMixerTimeEncoder(nn.Module):
+    """
+    out = linear(time_scatter): 1-->time_dims
+    out = cos(out)
+    """
+    def __init__(self, dim):
+        super(GrapMixerTimeEncoder, self).__init__()
+        self.dim = dim
+        self.dimension = dim
+        self.w = nn.Linear(1, dim)
+        self.reset_parameters()
+    
+    def reset_parameters(self, ):
+        self.w.weight = nn.Parameter((torch.from_numpy(1 / 10 ** np.linspace(0, 9, self.dim, dtype=np.float32))).reshape(self.dim, -1))
+        self.w.bias = nn.Parameter(torch.zeros(self.dim))
+
+        self.w.weight.requires_grad = False
+        self.w.bias.requires_grad = False
+    
+    @torch.no_grad()
+    def forward(self, t):
+        output = torch.cos(self.w(t.float().unsqueeze(-1)))
+        return output
+
+    
+class RawLearnableTimeEncoder(nn.Module):
+    """TGAT-style learnable harmonic encoder without log1p normalization."""
+
+    def __init__(self, dimension: int):
+        super().__init__()
+        self.dimension = dimension
+        self.w = nn.Linear(1, dimension)
+        frequency = 1.0 / (10.0 ** np.linspace(0, 9, dimension))
+        self.w.weight = nn.Parameter(
+            torch.from_numpy(frequency).float().reshape(dimension, 1)
+        )
+        self.w.bias = nn.Parameter(torch.zeros(dimension))
+
+    def forward(self, delta_t: torch.Tensor) -> torch.Tensor:
+        delta_t = delta_t.float().clamp_min(0.0).unsqueeze(-1)
+        angle = self.w(delta_t)
+        return torch.cat([torch.cos(angle), torch.sin(angle)], dim=-1)
+
+
+class FixedLogTimeEncoder(nn.Module):
+    """Fixed harmonic frequencies applied after log1p time normalization."""
+
+    def __init__(self, dimension: int):
+        super().__init__()
+        self.dimension = dimension
+        frequency = 1.0 / (10.0 ** torch.linspace(0, 9, dimension))
+        self.register_buffer("frequency", frequency)
+
+    def forward(self, delta_t: torch.Tensor) -> torch.Tensor:
+        tau = torch.log1p(delta_t.float().clamp_min(0.0)).unsqueeze(-1)
+        angle = tau * self.frequency
+        return torch.cat([torch.cos(angle), torch.sin(angle)], dim=-1)
+
+
+class HybridTimeEncoder(nn.Module):
+    """Stable fixed basis plus a bounded learnable residual."""
+
+    def __init__(self, dimension: int, residual_init: float = 0.01):
+        super().__init__()
+        self.dimension = dimension
+        frequency = 1.0 / (10.0 ** torch.linspace(0, 9, dimension))
+        self.register_buffer("fixed_frequency", frequency)
+        self.frequency_delta = nn.Parameter(torch.zeros(dimension))
+        self.phase = nn.Parameter(torch.zeros(dimension))
+        self.residual_scale = nn.Parameter(torch.tensor(float(residual_init)))
+
+    def forward(self, delta_t: torch.Tensor) -> torch.Tensor:
+        tau = torch.log1p(delta_t.float().clamp_min(0.0)).unsqueeze(-1)
+        fixed_angle = tau * self.fixed_frequency
+        # Multiplicative adjustment keeps frequencies positive and near init.
+        learned_frequency = self.fixed_frequency * torch.exp(
+            self.frequency_delta.clamp(-3.0, 3.0)
+        )
+        learned_angle = tau * learned_frequency + self.phase
+
+        fixed = torch.cat(
+            [torch.cos(fixed_angle), torch.sin(fixed_angle)], dim=-1
+        )
+        residual = torch.cat(
+            [torch.cos(learned_angle), torch.sin(learned_angle)], dim=-1
+        )
+        return fixed + torch.tanh(self.residual_scale) * residual
+
+
+def build_time_encoder(name: str, dimension: int) -> nn.Module:
+    name = name.lower()
+    if name == "atlas":
+        return TimeEncoder(dimension)
+    if name == "raw_learnable":
+        return RawLearnableTimeEncoder(dimension)
+    if name == "fixed_log":
+        return FixedLogTimeEncoder(dimension)
+    if name == "hybrid":
+        return HybridTimeEncoder(dimension)
+    if name == "graphmixer":
+        return GrapMixerTimeEncoder(dimension)
+    raise ValueError(
+        f"Unknown encoder '{name}'. Expected atlas, raw_learnable, "
+        "fixed_log, hybrid or graphmixer."
+    )

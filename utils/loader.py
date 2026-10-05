@@ -4,10 +4,11 @@ import pandas as pd
 import numpy as np
 from dataclasses import asdict, dataclass
 
-from .data_processing import EdgeDataset, GraphStorage
+from .data_processing import EdgeDataset
+from .graph import GraphStorage
 from .sampler import TemporalNeighborSampler
-from .data_processing import get_data, Graph, TemporalWalkSupervisionDataset, TemporalWalkDataset, TemporalWalkLinkDataset
-from .data_processing import collate_temporal_walk, collate_temporal_walk_link
+from .data_processing import TemporalWalkSupervisionDataset
+from .data_processing import collate_temporal_walk_link
 
 class TemporalLinkNeighborLoader:
 
@@ -116,7 +117,7 @@ class TemporalLinkNeighborLoader:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class Loaders:
+class AtlasLoaders:
     train_loader: DataLoader
     validation_loader: DataLoader
     test_loader: DataLoader
@@ -130,26 +131,35 @@ def load_loaders(
     num_neighbors: int = 30,
     supervision_mode: str = "soft",
     split_masks: str = "expanded",
-    num_workers: int = 0,
-) -> Loaders:
+    num_workers: int = 4,
+    testing_mode: bool = False,
+    beta = 0.001
+) -> AtlasLoaders:
     """Build chronological train/validation/test Atlas loaders.
 
     Graphs are cumulative: validation uses all interactions through the
     validation cutoff; test uses all interactions through the test cutoff.
     This avoids constructing evaluation neighborhoods from future events.
     """
-
-    graph_df = pd.read_csv('{}/ml_{}.csv'.format(path_file, dataset_name))
-    edge_features = np.load('{}/ml_{}.npy'.format(path_file, dataset_name))
-    node_features = np.load('{}/ml_{}_node.npy'.format(path_file, dataset_name)) 
     
-    val_time, test_time = list(np.quantile(graph_df.ts, [0.70, 0.85]))
-
+    graph_df = pd.read_csv('{}/ml_{}.csv'.format(path_file, dataset_name))
+    #edge_features = np.load('{}/ml_{}.npy'.format(path_file, dataset_name))
+    #node_features = np.load('{}/ml_{}_node.npy'.format(path_file, dataset_name)) 
+        
+    required = {"u", "i", "ts", "idx", "label"}
+    missing = required.difference(graph_df.columns)
+    if missing:
+        raise ValueError(f"Dataset is missing columns: {sorted(missing)}")
+   
     # source = frame["u"].to_numpy()
     # destination = frame["i"].to_numpy()
     # timestamp = frame["ts"].to_numpy()
     # edge_index = frame["idx"].to_numpy()
     # label = frame["label"].to_numpy()
+
+    if testing_mode:
+        graph_df = graph_df.head(10000)
+        print("Testing mode: using only first 10000 edges for quick testing.")
 
     source = graph_df.u.values
     destination = graph_df.i.values
@@ -158,6 +168,7 @@ def load_loaders(
     timestamp = graph_df.ts.values
 
     validation_time, test_time = np.quantile(timestamp, [0.70, 0.85])
+
     train_mask = timestamp <= validation_time
     validation_mask = (timestamp > validation_time) & (timestamp <= test_time)
     test_mask = timestamp > test_time
@@ -187,6 +198,7 @@ def load_loaders(
         source[train_mask],
         destination[train_mask],
         timestamp[train_mask],
+        edge_idxs=edge_index[train_mask]
     )
 
     if split_masks == "expanded":
@@ -194,9 +206,10 @@ def load_loaders(
             source[timestamp <= test_time],
             destination[timestamp <= test_time],
             timestamp[timestamp <= test_time],
+            edge_idxs=edge_index[timestamp <= test_time]
         )
 
-        graph_test = GraphStorage(source, destination, timestamp)
+        graph_test = GraphStorage(source, destination, timestamp, edge_index)
 
     elif split_masks == "isolated":
     
@@ -204,12 +217,14 @@ def load_loaders(
             source[validation_mask],
             destination[validation_mask],
             timestamp[validation_mask],
+            edge_idxs=edge_index[validation_mask]
         )
 
         graph_test = GraphStorage(
             source[test_mask],
             destination[test_mask],
             timestamp[test_mask],
+            edge_idxs=edge_index[test_mask]
         )
         
     else:
@@ -233,6 +248,8 @@ def load_loaders(
         train_sampler,
         num_nodes=num_nodes,
         supervision_mode=supervision_mode,
+        beta=beta,
+        is_fordward=True # future neighbors
     )
 
     validation_dataset = TemporalWalkSupervisionDataset(
@@ -241,6 +258,8 @@ def load_loaders(
         validation_sampler,
         num_nodes=num_nodes,
         supervision_mode=supervision_mode,
+        beta=beta,
+        is_fordward=True
     )
 
     test_dataset = TemporalWalkSupervisionDataset(
@@ -249,6 +268,8 @@ def load_loaders(
         test_sampler,
         num_nodes=num_nodes,
         supervision_mode=supervision_mode,
+        beta=beta,
+        is_fordward=False
     )
 
     loader_arguments = dict(
@@ -258,7 +279,7 @@ def load_loaders(
         collate_fn=collate_temporal_walk_link,
     )
 
-    return Loaders(
+    return AtlasLoaders(
         train_loader=DataLoader(
             train_dataset, shuffle=True, **loader_arguments
         ),
@@ -271,3 +292,4 @@ def load_loaders(
         num_nodes=num_nodes,
         pad_node=pad_node,
     )
+
