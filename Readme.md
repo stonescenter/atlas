@@ -163,7 +163,7 @@ Create a conda env and install all dependencies from file ``env.yml``
 Run
 
 ```bash
-python train_policy_distribution.py
+python train_policy_distribution_supervised.py
 ```
 
 or
