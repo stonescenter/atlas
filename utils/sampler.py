@@ -63,15 +63,22 @@ class TemporalNeighborSampler:
 
       return neighbors, times
 
-    def sample_k(self, node_id, current_time, is_forward=True):
+    def sample_k(self, node_id, current_time, is_forward=True, return_edge_idxs=False):
         '''
             Returns the K nearest neighbors of a node in the temporal graph,
             along with their timestamps > , < current_time and a validity mask.
         '''
-        neighbors, times = self.graph.get_neighbors_array(
-            node_id,
-            include_edge_weight=True,
-        )
+        if return_edge_idxs:
+            neighbors, times, edge_idxs = self.graph.get_neighbors_array(
+                node_id,
+                include_edge_weight=True,
+                include_edge_index=True,
+            )
+        else:
+            neighbors, times = self.graph.get_neighbors_array(
+                node_id,
+                include_edge_weight=True,
+            )
 
         neighbors = np.asarray(neighbors)
         times = np.asarray(times)
@@ -83,6 +90,8 @@ class TemporalNeighborSampler:
 
         neighbors = neighbors[mask]
         times = times[mask]
+        if return_edge_idxs:
+            edge_idxs = np.asarray(edge_idxs)[mask]
 
         # sort by temporal distance
         if is_forward:
@@ -92,12 +101,16 @@ class TemporalNeighborSampler:
 
         neighbors = neighbors[order]
         times = times[order]
+        if return_edge_idxs:
+            edge_idxs = edge_idxs[order]
 
         K = self.num_neighbors
 
         # keep first K
         neighbors = neighbors[:K]
         times = times[:K]
+        if return_edge_idxs:
+            edge_idxs = edge_idxs[:K]
 
         n_valid = len(neighbors)
 
@@ -112,6 +125,17 @@ class TemporalNeighborSampler:
         padded_times = np.zeros(K, dtype=np.float32)
 
         padded_times[:n_valid] = times
+
+        if return_edge_idxs:
+            padded_edge_idxs = np.full(K, -1, dtype=np.int64)
+            padded_edge_idxs[:n_valid] = edge_idxs
+            return (
+                padded_neighbors,
+                padded_times,
+                padded_edge_idxs,
+                valid_mask,
+                n_valid,
+            )
 
         return (
             padded_neighbors,

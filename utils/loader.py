@@ -1,5 +1,14 @@
 import torch
 from torch.utils.data import DataLoader
+import pandas as pd
+import numpy as np
+from dataclasses import asdict, dataclass
+
+from .data_processing import EdgeDataset
+from .graph import GraphStorage
+from .sampler import TemporalNeighborSampler
+from .data_processing import TemporalWalkSupervisionDataset
+from .data_processing import collate_temporal_walk_link
 
 class TemporalLinkNeighborLoader:
 
@@ -102,3 +111,185 @@ class TemporalLinkNeighborLoader:
                 "edge_label": batch_labels,
                 "samples": sampled_neighbors,
             } 
+
+# ---------------------------------------------------------------------------
+# Dataset construction shared by both experiments
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AtlasLoaders:
+    train_loader: DataLoader
+    validation_loader: DataLoader
+    test_loader: DataLoader
+    num_nodes: int
+    pad_node: int
+
+def load_loaders(
+    path_file: str,
+    dataset_name: str,
+    batch_size: int = 128,
+    num_neighbors: int = 30,
+    supervision_mode: str = "soft",
+    split_masks: str = "expanded",
+    num_workers: int = 4,
+    testing_mode: bool = False,
+    beta = 0.001
+) -> AtlasLoaders:
+    """Build chronological train/validation/test Atlas loaders.
+
+    Graphs are cumulative: validation uses all interactions through the
+    validation cutoff; test uses all interactions through the test cutoff.
+    This avoids constructing evaluation neighborhoods from future events.
+    """
+    
+    graph_df = pd.read_csv('{}/ml_{}.csv'.format(path_file, dataset_name))
+    #edge_features = np.load('{}/ml_{}.npy'.format(path_file, dataset_name))
+    #node_features = np.load('{}/ml_{}_node.npy'.format(path_file, dataset_name)) 
+        
+    required = {"u", "i", "ts", "idx", "label"}
+    missing = required.difference(graph_df.columns)
+    if missing:
+        raise ValueError(f"Dataset is missing columns: {sorted(missing)}")
+   
+    # source = frame["u"].to_numpy()
+    # destination = frame["i"].to_numpy()
+    # timestamp = frame["ts"].to_numpy()
+    # edge_index = frame["idx"].to_numpy()
+    # label = frame["label"].to_numpy()
+
+    if testing_mode:
+        graph_df = graph_df.head(10000)
+        print("Testing mode: using only first 10000 edges for quick testing.")
+
+    source = graph_df.u.values
+    destination = graph_df.i.values
+    edge_index = graph_df.idx.values
+    label = graph_df.label.values
+    timestamp = graph_df.ts.values
+
+    validation_time, test_time = np.quantile(timestamp, [0.70, 0.85])
+
+    train_mask = timestamp <= validation_time
+    validation_mask = (timestamp > validation_time) & (timestamp <= test_time)
+    test_mask = timestamp > test_time
+
+    train_edges = EdgeDataset(
+        source[train_mask], destination[train_mask], 
+        timestamp[train_mask], edge_index[train_mask], 
+        label[train_mask]
+    )
+
+    validation_edges = EdgeDataset(
+        source[validation_mask], destination[validation_mask],
+        timestamp[validation_mask], edge_index[validation_mask],
+        label[validation_mask]
+    )
+
+    test_edges = EdgeDataset(
+        source[test_mask], destination[test_mask], timestamp[test_mask],
+        edge_index[test_mask], label[test_mask]
+    )
+
+    all_nodes = set(source.tolist()) | set(destination.tolist())
+    num_nodes = int(max(all_nodes)) + 1 if all_nodes else 1
+    pad_node = num_nodes
+
+    graph_train = GraphStorage(
+        source[train_mask],
+        destination[train_mask],
+        timestamp[train_mask],
+        edge_idxs=edge_index[train_mask]
+    )
+
+    if split_masks == "expanded":
+        graph_validation = GraphStorage(
+            source[timestamp <= test_time],
+            destination[timestamp <= test_time],
+            timestamp[timestamp <= test_time],
+            edge_idxs=edge_index[timestamp <= test_time]
+        )
+
+        graph_test = GraphStorage(source, destination, timestamp, edge_index)
+
+    elif split_masks == "isolated":
+    
+        graph_validation = GraphStorage(
+            source[validation_mask],
+            destination[validation_mask],
+            timestamp[validation_mask],
+            edge_idxs=edge_index[validation_mask]
+        )
+
+        graph_test = GraphStorage(
+            source[test_mask],
+            destination[test_mask],
+            timestamp[test_mask],
+            edge_idxs=edge_index[test_mask]
+        )
+        
+    else:
+        print("not strategy for masking")
+
+    train_sampler = TemporalNeighborSampler(
+        graph_train, num_neighbors=num_neighbors, pad_node=pad_node
+    )
+
+    validation_sampler = TemporalNeighborSampler(
+        graph_validation, num_neighbors=num_neighbors, pad_node=pad_node
+    )
+
+    test_sampler = TemporalNeighborSampler(
+        graph_test, num_neighbors=num_neighbors, pad_node=pad_node
+    )
+
+    train_dataset = TemporalWalkSupervisionDataset(
+        train_edges,
+        graph_train,
+        train_sampler,
+        num_nodes=num_nodes,
+        supervision_mode=supervision_mode,
+        beta=beta,
+        is_fordward=True # future neighbors
+    )
+
+    validation_dataset = TemporalWalkSupervisionDataset(
+        validation_edges,
+        graph_validation,
+        validation_sampler,
+        num_nodes=num_nodes,
+        supervision_mode=supervision_mode,
+        beta=beta,
+        is_fordward=True
+    )
+
+    test_dataset = TemporalWalkSupervisionDataset(
+        test_edges,
+        graph_test,
+        test_sampler,
+        num_nodes=num_nodes,
+        supervision_mode=supervision_mode,
+        beta=beta,
+        is_fordward=False
+    )
+
+    loader_arguments = dict(
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        collate_fn=collate_temporal_walk_link,
+    )
+
+    return AtlasLoaders(
+        train_loader=DataLoader(
+            train_dataset, shuffle=True, **loader_arguments
+        ),
+        validation_loader=DataLoader(
+            validation_dataset, shuffle=False, **loader_arguments
+        ),
+        test_loader=DataLoader(
+            test_dataset, shuffle=False, **loader_arguments
+        ),
+        num_nodes=num_nodes,
+        pad_node=pad_node,
+    )
+
