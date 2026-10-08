@@ -143,21 +143,18 @@ cd atlas
 
 # Requirements
 
-Create a conda env and install all dependencies from file ``environment.yml``
+Create a conda env and install all dependencies from file ``env.yml``
 
 ---
 
 # Datasets
 
-Atlas has been evaluated on several temporal graph benchmarks.
+## Download our preprocessed datasets
 
-| Dataset | Task |
-|----------|------|
-| Wikipedia | Temporal Link Prediction |
-| Reddit | Temporal Link Prediction |
-| Enron | Temporal Link Prediction |
-| UCI | Temporal Link Prediction |
-| MOOC | Temporal Link Prediction |
+- Click [here](https://drive.google.com/file/d/1MNIAoA3eI5C7ysfCvmtJt1-_xz-Ggmym/view?usp=sharing) to download our preprocessed datasets.
+- Or you can use `gdow 1MNIAoA3eI5C7ysfCvmtJt1-_xz-Ggmym` 
+- Unzip the downloaded file
+- Place all dataset files under the ./data directory
 
 ---
 

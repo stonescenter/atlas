@@ -24,7 +24,7 @@ else:
     print("Device cuda not available, using cpu")
 
 DEVICE = torch.device(dev)
-PATH_DATASET = "/exp-local/steve/datasets/temporal/ml_preprocess/"
+PATH_DATASET = "./data/"
 
 
 def set_seed(seed: int = 2020):

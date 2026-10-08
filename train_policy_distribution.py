@@ -757,7 +757,7 @@ def evaluate_link_prediction(model, loader, device):
         "ap": ap,
     }
 
-PATH_DATASET = '/exp-local/steve/datasets/temporal/ml_preprocess/'
+PATH_DATASET = './data/'
 
 datasets = ['wikipedia', 'enron', 'collegemsg', 'mooc', 'reddit']
 
