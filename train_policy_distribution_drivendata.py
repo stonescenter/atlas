@@ -1,4 +1,5 @@
 import os
+
 import numpy as np
 import pandas as pd
 import random
@@ -26,6 +27,7 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 from utils.plots import *
 from utils.util import gradient_direction_stats
 from model.atlas import TemporalWalkEncoder
+from utils.md5 import ensure_directory, generate_md5_id
 
 if torch.cuda.is_available():
     dev = 'cuda'
@@ -616,8 +618,26 @@ def train_walk_policy(
                             device=target_probs.device,
                         )
                         target_probs = torch.cat([target_probs, pad], dim=1)
+
                 valid_mask = pos_mask.to(target_probs.dtype)
                 target_probs = target_probs * valid_mask
+
+                total = target_probs.sum(dim=-1, keepdim=True)
+                needs_fallback = (total <= 1e-12).squeeze(-1)
+
+                if needs_fallback.any():
+                    fallback_mass = valid_mask.sum(dim=-1, keepdim=True).clamp_min(1)
+                    fallback = torch.where(
+                        valid_mask,
+                        1.0 / fallback_mass,
+                        torch.zeros_like(target_probs),
+                    )
+                    target_probs = torch.where(
+                        needs_fallback.unsqueeze(-1),
+                        fallback,
+                        target_probs,
+                    )
+
                 target_probs = target_probs / (target_probs.sum(dim=-1, keepdim=True) + 1e-12)
                 log_probs = F.log_softmax(walk_logits / temperature, dim=-1)
                 walk_loss = F.kl_div(log_probs, target_probs, reduction="batchmean")
@@ -775,28 +795,60 @@ def evaluate_link_prediction(model, loader, device):
 
 PATH_DATASET = '/exp-local/steve/datasets/temporal/ml_preprocess/'
 
-datasets = ['wikipedia', 'enron', 'collegemsg', 'mooc', 'reddit']
+datasets = ['wikipedia', 'enron', 'taobao', 'collegemsg', 'mooc', 'reddit']
+
 datasets = ['enron', 'collegemsg', 'mooc', 'reddit']
 datasets = ['wikipedia', 'enron']
+datasets = ['taobao']
+datasets = ['wikipedia', 'enron', 'collegemsg', 'mooc', 'reddit']
 
 random.seed(2020)
 
 batch_size = 64
 num_neighbors = 30
-epochs = 20
-lambda_walks = [0.3]
-lambda_links = [0.7]
+embedding_dim = 32 #16 # 32 
+time_dim = 16 #8  # 16
+hidden_dim = 128 #64 # 128
+dropout = 0.1 # 0.2  # 0.1
+
+track_gradients = True
+
+split_masks = "None"
+#split_masks = "expanded" 
+
+lambda_walks = [0.3] # auxiliary task
+lambda_links = [1] # main task
+
 #modes = ["earliest", "sampled", "soft"]
 #modes = ["soft"]
 
 modes = ["observed_hard", "observed_sampled", "observed_soft"]
 modes = ["observed_soft"]
 
-experiment_root = "results/exp"
-os.makedirs(experiment_root, exist_ok=True)
+learning_rate = 3e-4
+time_learning_rate = 1e-4
+weight_decay = 1e-4
 
-n_runs = 5
+experiment_root = "results/experiments/drivendata"
+experiment_root = ensure_directory(experiment_root)
+
 optimizer = None
+time_encoder_type = "atlas"
+testing_mode = False # get 10k observations
+
+beta = -1 #0.001 # -1 quer dezir que vai escolher da media de betas, 0.001
+
+if testing_mode:
+    n_runs = 1
+    epochs = 5
+    datasets = ['wikipedia']
+else:
+    n_runs = 5
+    epochs = 8
+    #datasets = ['wikipedia', 'enron', 'taobao', 'collegemsg', 'mooc', 'reddit']
+    #datasets = ['collegemsg', 'enron', 'mooc', 'reddit']
+    datasets = ['wikipedia', 'collegemsg', 'enron']
+    datasets = ['wikipedia']
 
 for dataset_name in datasets:
     data_file = os.path.join(PATH_DATASET, f"ml_{dataset_name}.csv")
@@ -846,11 +898,14 @@ for dataset_name in datasets:
         sources[train_mask],
         destinations[train_mask],
         timestamps[train_mask],
+        edge_idxs=edge_idxs[train_mask]
     )
+
     graph_eval = GraphStorage(
         sources[test_mask],
         destinations[test_mask],
         timestamps[test_mask],
+        edge_idxs=edge_idxs[test_mask]
     )
 
     all_nodes = set(sources) | set(destinations)
@@ -865,7 +920,8 @@ for dataset_name in datasets:
     sampler_eval = TemporalNeighborSampler(graph_eval, num_neighbors=num_neighbors, pad_node=PAD_NODE)
 
     test_walks = TemporalWalkLinkDataset(test_data, graph_eval, sampler_eval, num_nodes=NUM_NODES)
-    print("test_walks", len(test_walks)) 
+    print("test_walks", len(test_walks))
+
     test_loader = DataLoader(
         test_walks,
         batch_size=batch_size,
@@ -874,9 +930,16 @@ for dataset_name in datasets:
         collate_fn=collate_temporal_walk_link,
     )
     print("test_loader:", len(test_loader))
-    
-    experiment = os.path.join(experiment_root, dataset_name)
-    os.makedirs(experiment, exist_ok=True)
+
+    # Continuation counts depend only on the training events, not on the
+    # supervision mode. Build this potentially large index once per dataset.
+    trajectory_index = ObservedTrajectoryIndex(
+        sources=train_data.sources,
+        destinations=train_data.destinations,
+        timestamps=train_data.timestamps,
+        max_horizon=None,
+        max_continuations=20,
+    )
 
     for mode in modes:
         '''
@@ -888,14 +951,6 @@ for dataset_name in datasets:
             supervision_mode=mode,
         )
         '''
-        trajectory_index = ObservedTrajectoryIndex(
-            sources=train_data.sources,
-            destinations=train_data.destinations,
-            timestamps=train_data.timestamps,
-            max_horizon=None,
-            max_continuations=20,
-        )
-        
         train_dataset = TemporalWalkSupervisionDataDriven(
             edge_dataset=train_data,
             graph=graph_train,
@@ -913,13 +968,33 @@ for dataset_name in datasets:
             collate_fn=collate_temporal_walk_link,
         )
 
+        experiment = os.path.join(experiment_root, dataset_name)
+        experiment_ = ensure_directory(experiment)
+
         for lambda_walk, lambda_link in zip(lambda_walks, lambda_links):
             auc_scores = []
             ap_scores = []
             
-            print(f"\nModel params:")
-            print(f"\tlambda_walk: {lambda_walk}, lambda_link: {lambda_link}")
-            print(f"\tsupervision_mode: {mode}")
+            output = f"Model params:\n"
+            output = output + f"\tSupervision_mode: {mode}, beta: {beta}, lambda_walk: {lambda_walk}, lambda_link: {lambda_link}, split_masks: {split_masks}\n"  
+            output = output + f"\tModel dim: {embedding_dim}, time_dim: {time_dim}, hidden_dim: {hidden_dim}, dropout: {dropout}\n"            
+            output = output + f"\tConfig model epochs: {epochs}, batch_size: {batch_size}, K neighbors: {num_neighbors}\n"
+            
+            id_md5 = generate_md5_id(output)
+            experiment = os.path.join(experiment_, id_md5)
+            if os.path.isdir(experiment):
+                print(f"Experiment with same parameters already exists: {id_md5}. Skipping...")
+                continue
+
+            experiment = ensure_directory(experiment)
+
+            output = output + f"\tDate: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            output = output + f"\tSaved: {experiment}"
+            
+            print(output)
+
+            with open(f"{experiment}/parameters.txt", "w") as file:
+                file.write(output)
 
             for run_idx in range(n_runs):
                 set_seed(2020 + run_idx)
@@ -927,9 +1002,11 @@ for dataset_name in datasets:
 
                 model = TemporalWalkEncoder(
                     num_nodes=NUM_NODES,
-                    embedding_dim=32,
-                    time_dim=16,
-                    pad_node=PAD_NODE,
+                    embedding_dim=embedding_dim,
+                    time_dim=time_dim,
+                    hidden_dim=hidden_dim,
+                    pad_node=PAD_NODE, 
+                    dropout=dropout,
                     debug=False,
                 ).to(device)
 
